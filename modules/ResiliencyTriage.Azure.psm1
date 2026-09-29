@@ -294,16 +294,64 @@ function Get-RtReview {
 
 #region Recommendations
 
-function Get-RtLinkedSubscription {
-    <# Uses Resource Graph to find subscriptions that hold review-linked Advisor recommendations. #>
+function Get-RtGraphReviewRecommendation {
+    <#
+    .SYNOPSIS
+        Review-linked Advisor recommendations from Resource Graph.
+    .DESCRIPTION
+        The ARM list API omits title (label), description, benefits and notes of review
+        recommendations; Resource Graph has them. Used to enrich the live ARM data.
+    #>
     param([Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string[]]$SubscriptionId)
     $query = @"
 advisorresources
 | where type =~ 'microsoft.advisor/recommendations'
 | where isnotempty(properties.review)
-| distinct subscriptionId
+| project id, name, subscriptionId, properties
 "@
-    @(Invoke-RtGraphQuery -Token $Token -Query $query -SubscriptionId $SubscriptionId | ForEach-Object { [string]$_.subscriptionId })
+    @(Invoke-RtGraphQuery -Token $Token -Query $query -SubscriptionId $SubscriptionId)
+}
+
+function Merge-RtRecommendationSource {
+    <#
+    .SYNOPSIS
+        Merges live ARM recommendations with Resource Graph rows (matched by recommendation name).
+    .DESCRIPTION
+        ARM wins for the status (Resource Graph lags a few minutes). Missing text fields are
+        copied from Resource Graph. Rows only present in Resource Graph are added as they are.
+    #>
+    param([AllowEmptyCollection()][object[]]$Arm = @(), [AllowEmptyCollection()][object[]]$Graph = @())
+    $textFields = 'label', 'description', 'potentialBenefits', 'notes', 'learnMoreLink'
+    $byName = @{}
+    foreach ($g in $Graph) { $n = [string](Get-RtProp $g 'name'); if ($n) { $byName[$n.ToLowerInvariant()] = $g } }
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($a in $Arm) {
+        $n = [string](Get-RtProp $a 'name')
+        $null = $seen.Add($n)
+        $g = if ($n) { $byName[$n.ToLowerInvariant()] } else { $null }
+        $p = Get-RtProp $a 'properties' $null
+        if ($g -and $p) {
+            foreach ($f in $textFields) {
+                $v = [string](Get-RtProp $g "properties.$f")
+                if ($v -and -not [string](Get-RtProp $p $f)) { $p | Add-Member -NotePropertyName $f -NotePropertyValue $v -Force }
+            }
+        }
+        $a
+    }
+    foreach ($g in $Graph) { if (-not $seen.Contains([string](Get-RtProp $g 'name'))) { $g } }
+}
+
+function Get-RtResourceTypeFromId {
+    <# 'Microsoft.Storage/storageAccounts' from a resource ID (nested types included). #>
+    param([string]$ResourceId)
+    if ($ResourceId -notmatch '(?i)/providers/([^/]+)/(.+)$') {
+        if ($ResourceId -match '(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+$') { return 'Microsoft.Resources/resourceGroups' }
+        if ($ResourceId -match '(?i)^/subscriptions/[^/]+$') { return 'Microsoft.Resources/subscriptions' }
+        return ''
+    }
+    $ns = $Matches[1]; $parts = $Matches[2].Split('/')
+    $types = for ($i = 0; $i -lt $parts.Count; $i += 2) { $parts[$i] }
+    return "$ns/$($types -join '/')"
 }
 
 function Get-RtRawReviewRecommendation {
@@ -357,9 +405,14 @@ function ConvertTo-RtRecommendation {
         if (-not $review) { continue }
 
         $title = [string](Get-RtProp $p 'label')
-        if (-not $title) { $title = [string](Get-RtProp $p 'shortDescription.problem') }
         $typeId = [string](Get-RtProp $p 'recommendationTypeId')
         $key = '{0}|{1}|{2}' -f $review.ReviewId, $typeId, $title
+        if (-not $title) {
+            # No label: the short description is generic for review items, so never group on it.
+            $title = [string](Get-RtProp $p 'shortDescription.problem')
+            if (-not $title) { $title = '(untitled recommendation)' }
+            $key += '|' + [string](Get-RtProp $raw 'name')
+        }
 
         if (-not $groups.Contains($key)) {
             $priority = [string](Get-RtProp $p 'trackedProperties.priority')
@@ -393,13 +446,18 @@ function ConvertTo-RtRecommendation {
         if (-not $resourceId -and $armId -match '(?i)^(.+)/providers/Microsoft\.Advisor/recommendations/') { $resourceId = $Matches[1] }
         $subId = if ($armId -match '(?i)^/subscriptions/([^/]+)') { $Matches[1] } else { $review.SubscriptionId }
         $rawStatus = [string](Get-RtProp $p 'recommendationStatus' 'New')
+        # impactedField/impactedValue are unreliable for review items, the resource ID is not.
+        $resType = Get-RtResourceTypeFromId $resourceId
+        if (-not $resType) { $resType = [string](Get-RtProp $p 'impactedField') }
+        $resName = if ($resourceId) { $resourceId.TrimEnd('/').Split('/')[-1] } else { [string](Get-RtProp $p 'impactedValue') }
         $groups[$key].Resources.Add([pscustomobject]@{
             RecommendationArmId = $armId
             RecommendationName  = [string](Get-RtProp $raw 'name')
+            RecommendationTypeId = $typeId
             SubscriptionId      = $subId
             ResourceId          = $resourceId
-            ResourceName        = [string](Get-RtProp $p 'impactedValue' ($resourceId.Split('/')[-1]))
-            ResourceType        = [string](Get-RtProp $p 'impactedField')
+            ResourceName        = $resName
+            ResourceType        = $resType
             ResourceGroup       = Get-RtResourceGroupFromId $resourceId
             Status              = ConvertTo-RtStatusBucket $rawStatus
             RawStatus           = $rawStatus
@@ -440,14 +498,17 @@ function Get-RtReviewRecommendation {
     )
     $targets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($r in $Review) { $null = $targets.Add($r.SubscriptionId) }
+    $graph = @()
     try {
-        foreach ($s in (Get-RtLinkedSubscription -Token $Token -SubscriptionId $ScanSubscription)) { $null = $targets.Add($s) }
+        $graph = @(Get-RtGraphReviewRecommendation -Token $Token -SubscriptionId $ScanSubscription)
+        foreach ($g in $graph) { $null = $targets.Add([string]$g.subscriptionId) }
     }
     catch {
-        # Resource Graph unavailable -> fall back to scanning every subscription in scope.
+        # Resource Graph unavailable -> scan every subscription in scope (titles may be generic).
         foreach ($s in $ScanSubscription) { $null = $targets.Add($s) }
     }
-    $raw = @(Get-RtRawReviewRecommendation -Token $Token -SubscriptionId @($targets))
+    $arm = @(Get-RtRawReviewRecommendation -Token $Token -SubscriptionId @($targets))
+    $raw = @(Merge-RtRecommendationSource -Arm $arm -Graph $graph)
     return ConvertTo-RtRecommendation -RawRecommendation $raw -Review $Review
 }
 
@@ -539,15 +600,47 @@ function Export-RtRecommendation {
 
 #region Status update (runs in a background thread job)
 
+function Get-RtUpdateOutcome {
+    <#
+    .SYNOPSIS
+        Decides the result of one status change from the PATCH result and the re-read status.
+    .DESCRIPTION
+        The re-read status is the truth: Advisor may answer a PATCH with an error (e.g. 404
+        while a sibling update is applied) and still end up in the target status.
+    #>
+    param([string]$Target, [string]$ActualStatus, [string]$PatchError, [string]$ReadError)
+    $bucket = if ($ActualStatus) { ConvertTo-RtStatusBucket $ActualStatus } else { '' }
+    $targetBucket = ConvertTo-RtStatusBucket $Target
+    if ($bucket -and $bucket -eq $targetBucket) {
+        $msg = if ($PatchError) { "Verified $ActualStatus (PATCH reported: $PatchError)" } else { "Updated, verified $ActualStatus." }
+        return [pscustomobject]@{ Success = $true; Verified = $true; Message = $msg }
+    }
+    if (-not $PatchError -and -not $bucket) {
+        # PATCH accepted but the re-read failed -> count it, flag it as unverified.
+        return [pscustomobject]@{ Success = $true; Verified = $false; Message = "Updated, not verified ($ReadError)" }
+    }
+    if (-not $PatchError) {
+        return [pscustomobject]@{ Success = $false; Verified = $true; Message = "PATCH accepted, but status is still $ActualStatus." }
+    }
+    if ($ReadError -match 'HTTP 404') {
+        return [pscustomobject]@{ Success = $false; Verified = $true; Message = "Recommendation no longer exists (resource deleted?). $PatchError" }
+    }
+    $now = if ($ActualStatus) { " Current status: $ActualStatus." } else { '' }
+    return [pscustomobject]@{ Success = $false; Verified = [bool]$ActualStatus; Message = "$PatchError$now" }
+}
+
 function Invoke-RtStatusUpdate {
     <#
     .SYNOPSIS
-        Sets the Advisor status on every given resource-level recommendation.
+        Sets the Advisor status on every given resource-level recommendation and verifies it.
     .DESCRIPTION
-        Runs the PATCH calls in parallel. Resources that fail (typically because the resource
-        was deleted and its recommendation is gone) are skipped and reported, never retried.
+        Recommendations on the same resource with the same type are handled one after another
+        (Advisor may apply one change to all of them; parallel calls then collide with 404).
+        Each item is re-read after the PATCH; the re-read status decides success.
+        -Sibling items are only re-read, to detect changes Azure applied to them as well.
     .OUTPUTS
-        One result per resource: RecommendationArmId, ResourceName, Success, Message.
+        One result per item: Kind (Target/Sibling), RecommendationArmId, ResourceName,
+        Success, Verified, ActualStatus, Message.
     #>
     param(
         [string]$Token,
@@ -555,6 +648,7 @@ function Invoke-RtStatusUpdate {
         [Parameter(Mandatory)][ValidateSet('Postponed', 'Completed', 'Dismissed', 'New')][string]$Status,
         [string]$DismissReason = 'Other',
         [datetime]$PostponedUntil = (Get-Date).AddDays(90),
+        [object[]]$Sibling = @(),
         [int]$ThrottleLimit = 8,
         [switch]$Demo
     )
@@ -562,37 +656,87 @@ function Invoke-RtStatusUpdate {
     if ($Status -eq 'Dismissed') { $properties['recommendationDismissReason'] = $DismissReason }
     if ($Status -eq 'Postponed') { $properties['postponedUntilDateTime'] = $PostponedUntil.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
     $body = @{ properties = $properties }
-    $armFn = ${function:Invoke-RtArm}.ToString()
-    $propFn = ${function:Get-RtProp}.ToString()
+    $fns = @{}
+    foreach ($n in 'Invoke-RtArm', 'Get-RtProp', 'ConvertTo-RtStatusBucket', 'Get-RtUpdateOutcome') { $fns[$n] = (Get-Item "function:$n").ScriptBlock.ToString() }
     $api = $script:AdvisorApiVersion
     $isDemo = [bool]$Demo
 
-    $Resource | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
-        ${function:Invoke-RtArm} = [scriptblock]::Create($using:armFn)
-        ${function:Get-RtProp} = [scriptblock]::Create($using:propFn)
-        $res = $_
-        $result = [pscustomobject]@{ RecommendationArmId = $res.RecommendationArmId; ResourceName = $res.ResourceName; Success = $false; Message = '' }
-        if ($using:isDemo) {
-            Start-Sleep -Milliseconds (Get-Random -Minimum 150 -Maximum 700)
-            if ($res.ResourceName -match 'deleted') { $result.Message = 'HTTP 404 PATCH : ResourceNotFound - The resource no longer exists.' }
-            else { $result.Success = $true; $result.Message = 'Updated (demo).' }
-            return $result
+    # One work unit per resource + recommendation type; siblings ride along for the re-read.
+    $units = [ordered]@{}
+    foreach ($kind in 'Target', 'Sibling') {
+        $list = if ($kind -eq 'Target') { $Resource } else { $Sibling }
+        foreach ($r in @($list)) {
+            if ($null -eq $r) { continue }
+            $k = ('{0}|{1}' -f $r.ResourceId, (Get-RtProp $r 'RecommendationTypeId')).ToLowerInvariant()
+            if (-not $units.Contains($k)) { $units[$k] = [System.Collections.Generic.List[object]]::new() }
+            $units[$k].Add([pscustomobject]@{ Kind = $kind; Item = $r })
         }
-        # Documented route is subscription scoped; the resource-scoped ID is the fallback.
-        $paths = @("/subscriptions/$($res.SubscriptionId)/providers/Microsoft.Advisor/recommendations/$($res.RecommendationName)")
-        if ($res.RecommendationArmId -and $res.RecommendationArmId -ne $paths[0]) { $paths += $res.RecommendationArmId }
-        foreach ($path in $paths) {
-            try {
-                $null = Invoke-RtArm -Token $using:Token -Path $path -ApiVersion $using:api -Method PATCH -Body $using:body
-                $result.Success = $true; $result.Message = 'Updated.'
-                break
+    }
+
+    @($units.Values) | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+        foreach ($e in ($using:fns).GetEnumerator()) { Set-Item "function:$($e.Key)" ([scriptblock]::Create($e.Value)) }
+        $token = $using:Token; $api = $using:api; $target = $using:Status
+
+        $read = {
+            param($res)
+            $out = @{ Status = ''; Error = '' }
+            try { $out.Status = [string](Get-RtProp (Invoke-RtArm -Token $token -Path $res.RecommendationArmId -ApiVersion $api) 'properties.recommendationStatus') }
+            catch { $out.Error = $_.Exception.Message }
+            $out
+        }
+
+        foreach ($entry in @($_ | Sort-Object { $_.Kind -ne 'Target' })) {
+            $res = $entry.Item
+            $result = [ordered]@{ Kind = $entry.Kind; RecommendationArmId = $res.RecommendationArmId; ResourceName = $res.ResourceName; Success = $false; Verified = $false; ActualStatus = ''; Message = '' }
+
+            if ($using:isDemo) {
+                Start-Sleep -Milliseconds (Get-Random -Minimum 150 -Maximum 600)
+                if ($entry.Kind -eq 'Sibling') { $result.ActualStatus = $res.RawStatus; $result.Verified = $true }
+                elseif ($res.ResourceName -match 'deleted') { $result.Verified = $true; $result.Message = 'Recommendation no longer exists (resource deleted?). HTTP 404 PATCH : ResourceNotFound' }
+                else { $result.Success = $true; $result.Verified = $true; $result.ActualStatus = $target; $result.Message = "Updated, verified $target (demo)." }
+                [pscustomobject]$result
+                continue
             }
-            catch { $result.Message = $_.Exception.Message }
+
+            if ($entry.Kind -eq 'Sibling') {
+                $now = & $read $res
+                $result.ActualStatus = $now.Status; $result.Verified = [bool]$now.Status; $result.Message = $now.Error
+                [pscustomobject]$result
+                continue
+            }
+
+            # Already in the target status (e.g. changed together with a sibling) -> nothing to PATCH.
+            $before = & $read $res
+            if ($before.Status -and (ConvertTo-RtStatusBucket $before.Status) -eq (ConvertTo-RtStatusBucket $target)) {
+                $result.Success = $true; $result.Verified = $true; $result.ActualStatus = $before.Status
+                $result.Message = "Already $($before.Status) (verified, no change needed)."
+                [pscustomobject]$result
+                continue
+            }
+
+            # Documented route is subscription scoped; the resource-scoped ID is the fallback.
+            $patchError = ''
+            $paths = @("/subscriptions/$($res.SubscriptionId)/providers/Microsoft.Advisor/recommendations/$($res.RecommendationName)")
+            if ($res.RecommendationArmId -and $res.RecommendationArmId -ne $paths[0]) { $paths += $res.RecommendationArmId }
+            foreach ($path in $paths) {
+                try { $null = Invoke-RtArm -Token $token -Path $path -ApiVersion $api -Method PATCH -Body $using:body; $patchError = ''; break }
+                catch { $patchError = $_.Exception.Message }
+            }
+
+            # Re-read until the target status shows up (Advisor applies changes asynchronously).
+            $after = $null
+            foreach ($delay in 1, 2, 4) {
+                Start-Sleep -Seconds $delay
+                $after = & $read $res
+                if ($after.Status -and (ConvertTo-RtStatusBucket $after.Status) -eq (ConvertTo-RtStatusBucket $target)) { break }
+                if (-not $after.Status -and $after.Error -match 'HTTP 404' -and $patchError) { break }
+            }
+            $outcome = Get-RtUpdateOutcome -Target $target -ActualStatus $after.Status -PatchError $patchError -ReadError $after.Error
+            $result.Success = $outcome.Success; $result.Verified = $outcome.Verified; $result.ActualStatus = $after.Status; $result.Message = $outcome.Message
+            [pscustomobject]$result
         }
-        $result
     }
 }
-
 function Start-RtStatusUpdateJob {
     <# Starts Invoke-RtStatusUpdate as a background thread job and returns a tracking object. #>
     param(
@@ -602,15 +746,16 @@ function Start-RtStatusUpdateJob {
         [Parameter(Mandatory)][string]$Status,
         [string]$DismissReason = 'Other',
         [datetime]$PostponedUntil = (Get-Date).AddDays(90),
+        [object[]]$Sibling = @(),
         [switch]$Demo
     )
     $modulePath = $PSCommandPath
     $job = Start-ThreadJob -Name ('RtUpdate-{0}' -f ([guid]::NewGuid().ToString('N').Substring(0, 8))) -ScriptBlock {
-        param($ModulePath, $Token, $Resource, $Status, $DismissReason, $PostponedUntil, $Demo)
+        param($ModulePath, $Token, $Resource, $Status, $DismissReason, $PostponedUntil, $Sibling, $Demo)
         Import-Module $ModulePath -Force
         Invoke-RtStatusUpdate -Token $Token -Resource $Resource -Status $Status -DismissReason $DismissReason `
-            -PostponedUntil $PostponedUntil -Demo:$Demo
-    } -ArgumentList $modulePath, $Token, $Resource, $Status, $DismissReason, $PostponedUntil, ([bool]$Demo)
+            -PostponedUntil $PostponedUntil -Sibling $Sibling -Demo:$Demo
+    } -ArgumentList $modulePath, $Token, $Resource, $Status, $DismissReason, $PostponedUntil, @($Sibling), ([bool]$Demo)
     [pscustomobject]@{
         Job            = $job
         Recommendation = $Recommendation
@@ -702,7 +847,7 @@ Export-ModuleMember -Function @(
     'Get-RtProp', 'Get-RtDismissReason', 'Get-RtPriorityRank', 'ConvertTo-RtStatusBucket',
     'Assert-RtAzModule', 'Get-RtAzContextInfo', 'Connect-RtAzure', 'Get-RtArmToken',
     'Invoke-RtArm', 'Get-RtSubscription', 'Invoke-RtGraphQuery',
-    'Get-RtReview', 'Get-RtReviewRecommendation', 'ConvertTo-RtRecommendation', 'Update-RtRecommendationStatus',
+    'Get-RtReview', 'Get-RtReviewRecommendation', 'Get-RtGraphReviewRecommendation', 'Merge-RtRecommendationSource', 'Get-RtResourceTypeFromId', 'ConvertTo-RtRecommendation', 'Update-RtRecommendationStatus',
     'Get-RtSummary', 'Export-RtRecommendation',
-    'Invoke-RtStatusUpdate', 'Start-RtStatusUpdateJob', 'New-RtDemoData'
+    'Get-RtUpdateOutcome', 'Invoke-RtStatusUpdate', 'Start-RtStatusUpdateJob', 'New-RtDemoData'
 )

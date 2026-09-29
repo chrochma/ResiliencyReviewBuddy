@@ -446,7 +446,7 @@ function Show-RtFilterList {
             $body.Add(($j -eq $index) ? (Format-RtSelected $row ($size.Width - 1)) : $row)
         }
         if ($matchIdx.Count -gt $visible) { $body.Add("$($script:C.Muted)  … showing $($top + 1)-$([Math]::Min($top + $visible, $matchIdx.Count)) of $($matchIdx.Count)$($script:C.Reset)") }
-        Write-RtFrame (New-RtScreen -Top (Get-RtTitleLines $Title) -Body $body -Footer 'Type to filter   ↑↓ PgUp PgDn move   Enter open   Backspace delete   Esc clear / back')
+        Write-RtFrame (New-RtScreen -Top (Get-RtTitleLines $Title) -Body $body -Footer 'Type to filter   ↑↓ PgUp PgDn move   Enter select   Backspace delete   Esc clear / back')
 
         $k = Read-RtKey -OnTick $OnTick
         if ($null -eq $k) { continue }

@@ -87,6 +87,46 @@ Remove-Job $tracker.Job -Force
 Assert-That ($results.Count -eq $target.Resources.Count) 'one result per resource'
 Assert-That (@($results | Where-Object { -not $_.Success }).Count -eq $expectedFail) "deleted resources reported as failed ($expectedFail)"
 Assert-That (@($results | Where-Object Success).Count -eq ($target.Resources.Count - $expectedFail)) 'remaining resources succeeded'
+Assert-That (-not ($results | Where-Object { $_.Kind -ne 'Target' })) 'no sibling results without siblings'
+
+$sib = @($recs | Where-Object { $_ -ne $target } | Select-Object -First 1 | ForEach-Object { $_.Resources[0] })
+$tracker = Start-RtStatusUpdateJob -Recommendation $target -Resource $target.Resources[0] -Status Completed -Sibling $sib -Demo
+$results = @($tracker.Job | Wait-Job -Timeout 60 | Receive-Job)
+Remove-Job $tracker.Job -Force
+Assert-That (@($results | Where-Object Kind -eq 'Sibling').Count -eq 1) 'sibling re-read reported'
+
+Write-Host 'Update verification' -ForegroundColor Cyan
+$o = Get-RtUpdateOutcome -Target Completed -ActualStatus Completed -PatchError 'HTTP 404 PATCH : '
+Assert-That ($o.Success -and $o.Verified) 'PATCH 404 but status Completed -> success (verified)'
+$o = Get-RtUpdateOutcome -Target Completed -ActualStatus Completed
+Assert-That ($o.Success -and $o.Verified) 'PATCH ok + status Completed -> success'
+$o = Get-RtUpdateOutcome -Target Dismissed -ActualStatus Rejected -PatchError 'HTTP 409'
+Assert-That ($o.Success) 'legacy Rejected counts as Dismissed'
+$o = Get-RtUpdateOutcome -Target Completed -ActualStatus '' -PatchError 'HTTP 404 PATCH : ' -ReadError 'HTTP 404 GET : '
+Assert-That (-not $o.Success -and $o.Message -match 'no longer exists') 'deleted resource -> failed'
+$o = Get-RtUpdateOutcome -Target Completed -ActualStatus New -PatchError 'HTTP 403 PATCH : '
+Assert-That (-not $o.Success) 'PATCH 403 and status unchanged -> failed'
+$o = Get-RtUpdateOutcome -Target Completed -ActualStatus '' -ReadError 'timeout'
+Assert-That ($o.Success -and -not $o.Verified) 'PATCH ok but re-read failed -> success, unverified'
+
+Write-Host 'Resource Graph enrichment' -ForegroundColor Cyan
+$arm = [pscustomobject]@{ id = '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/st1/providers/Microsoft.Advisor/recommendations/abc'; name = 'abc'
+    properties = [pscustomobject]@{ recommendationStatus = 'Completed'; recommendationTypeId = 't'; review = [pscustomobject]@{ id = $demo.Reviews[0].ReviewId; name = 'x' }
+        shortDescription = [pscustomobject]@{ problem = 'CX Observer Personalized Recommendation' } } }
+$graph = @(
+    [pscustomobject]@{ name = 'ABC'; subscriptionId = 's'; properties = [pscustomobject]@{ label = 'Ensure ZRS'; description = 'desc'; recommendationStatus = 'New' } }
+    [pscustomobject]@{ name = 'only-graph'; id = '/subscriptions/s/providers/Microsoft.Advisor/recommendations/only-graph'; subscriptionId = 's'; properties = [pscustomobject]@{ label = 'Other'; recommendationStatus = 'New'; review = [pscustomobject]@{ id = $demo.Reviews[0].ReviewId } } }
+)
+$merged = @(Merge-RtRecommendationSource -Arm @($arm) -Graph $graph)
+Assert-That ($merged.Count -eq 2) 'ARM + Graph-only rows merged'
+Assert-That ($merged[0].properties.label -eq 'Ensure ZRS' -and $merged[0].properties.recommendationStatus -eq 'Completed') 'label from Graph, status from ARM'
+$g = @(ConvertTo-RtRecommendation -RawRecommendation $merged -Review $demo.Reviews)
+Assert-That ($g.Count -eq 2 -and ($g.Title -contains 'Ensure ZRS')) 'enriched titles used for grouping'
+$noLabel = @($arm, ($arm | ConvertTo-Json -Depth 10 | ConvertFrom-Json)); $noLabel[1].name = 'def'
+foreach ($x in $noLabel) { $x.properties.PSObject.Properties.Remove('label'); $x.properties.PSObject.Properties.Remove('description') }
+Assert-That (@(ConvertTo-RtRecommendation -RawRecommendation $noLabel -Review $demo.Reviews).Count -eq 2) 'untitled items are never merged'
+Assert-That ((Get-RtResourceTypeFromId '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/st1') -eq 'Microsoft.Storage/storageAccounts') 'resource type from ID'
+Assert-That ((Get-RtResourceTypeFromId '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Sql/servers/sq/databases/db') -eq 'Microsoft.Sql/servers/databases') 'nested resource type from ID'
 
 Write-Host 'TUI helpers' -ForegroundColor Cyan
 $ansi = "$([char]27)[91mHello$([char]27)[0m World"

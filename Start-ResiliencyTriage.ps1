@@ -213,8 +213,19 @@ function Add-Notice {
     $state.History.Add(([regex]::Replace($Text, '\e\[[0-9;?]*[A-Za-z]', '')))
 }
 
+function Find-RtResourceEntry {
+    <# All loaded resource entries (with their recommendation) for the given recommendation ARM IDs. #>
+    param([string[]]$ArmId)
+    $ids = [System.Collections.Generic.HashSet[string]]::new([string[]]@($ArmId), [StringComparer]::OrdinalIgnoreCase)
+    foreach ($rec in $state.Recommendations) {
+        foreach ($res in $rec.Resources) {
+            if ($ids.Contains([string]$res.RecommendationArmId)) { [pscustomobject]@{ Recommendation = $rec; Resource = $res } }
+        }
+    }
+}
+
 function Update-Jobs {
-    <# Collects finished background updates, applies them locally and reports. Returns $true on change. #>
+    <# Collects finished background updates, applies the verified status locally and reports. Returns $true on change. #>
     $changed = $false
     foreach ($t in @($state.Jobs)) {
         if ($t.Job.State -in 'NotStarted', 'Running') { continue }
@@ -225,35 +236,52 @@ function Update-Jobs {
         $null = $state.Jobs.Remove($t)
         $changed = $true
 
-        $ok = @($results | Where-Object Success)
-        $failed = @($results | Where-Object { -not $_.Success })
-        # Apply the new status locally for every resource that was updated in Azure.
-        $okIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach ($o in $ok) { $null = $okIds.Add([string]$o.RecommendationArmId) }
-        foreach ($res in $t.Recommendation.Resources) {
-            if ($okIds.Contains([string]$res.RecommendationArmId)) { $res.Status = ConvertTo-RtStatusBucket $t.Status; $res.RawStatus = $t.Status }
-        }
-        Update-RtRecommendationStatus -Recommendation $t.Recommendation
+        $targets = @($results | Where-Object Kind -eq 'Target')
+        $ok = @($targets | Where-Object Success)
+        $failed = @($targets | Where-Object { -not $_.Success })
+        $unverified = @($ok | Where-Object { -not $_.Verified })
 
-        $title = Format-RtCell $t.Recommendation.Title 48
+        # Apply the status Azure reports now (re-read after the update) to every loaded entry.
+        $touched = [System.Collections.Generic.HashSet[object]]::new()
+        $null = $touched.Add($t.Recommendation)
+        $siblingChanged = 0
+        $byId = @{}
+        foreach ($r in $results) { $byId[([string]$r.RecommendationArmId).ToLowerInvariant()] = $r }
+        foreach ($e in @(Find-RtResourceEntry -ArmId @($byId.Keys))) {
+            $r = $byId[([string]$e.Resource.RecommendationArmId).ToLowerInvariant()]
+            $actual = [string]$r.ActualStatus
+            if (-not $actual -and $r.Kind -eq 'Target' -and $r.Success) { $actual = $t.Status }
+            if (-not $actual) { continue }
+            $bucket = ConvertTo-RtStatusBucket $actual
+            if ($r.Kind -eq 'Sibling' -and $bucket -ne $e.Resource.Status) { $siblingChanged++ }
+            $e.Resource.Status = $bucket; $e.Resource.RawStatus = $actual
+            $null = $touched.Add($e.Recommendation)
+        }
+        foreach ($rec in $touched) { Update-RtRecommendationStatus -Recommendation $rec }
+
+        $title = (Format-RtCell $t.Recommendation.Title 48).Trim()
         if ($jobError) {
-            Add-Notice "$($Clr.Error)✗ $($t.Status) · $($title.Trim()) : background job failed - $jobError$($Clr.Reset)"
+            Add-Notice "$($Clr.Error)✗ $($t.Status) · $title : background job failed - $jobError$($Clr.Reset)"
             continue
         }
         $logHint = ''
-        if ($failed.Count) {
+        if ($failed.Count -or $unverified.Count) {
             $logDir = Join-Path $ExportPath 'logs'
             $null = New-Item -ItemType Directory -Path $logDir -Force
-            $log = Join-Path $logDir ('failed-{0}-{1}.csv' -f $t.Status, (Get-Date -Format 'yyyyMMdd-HHmmss'))
-            $failed | Select-Object ResourceName, RecommendationArmId, Message | Export-Csv -Path $log -NoTypeInformation -Encoding utf8BOM
+            $log = Join-Path $logDir ('update-{0}-{1}.csv' -f $t.Status, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+            $targets | Select-Object ResourceName, Success, Verified, ActualStatus, Message, RecommendationArmId |
+                Export-Csv -Path $log -NoTypeInformation -Encoding utf8BOM
             $logHint = "  $($Clr.Muted)(details: $log)$($Clr.Reset)"
         }
         $color = if ($failed.Count) { $Clr.Warn } else { $Clr.Ok }
-        Add-Notice ("{0}✓ {1} · {2} : {3} resource(s) updated, {4} failed/skipped{5}{6}" -f $color, $t.Status, $title.Trim(), $ok.Count, $failed.Count, $Clr.Reset, $logHint)
+        $mark = if ($failed.Count) { '!' } else { '✓' }
+        $extra = ''
+        if ($unverified.Count) { $extra += ", $($unverified.Count) not yet confirmed" }
+        if ($siblingChanged) { $extra += ", Azure also changed $siblingChanged related item(s)" }
+        Add-Notice ("{0}{1} {2} · {3} : {4} of {5} resource(s) verified {2}, {6} failed{7}{8}{9}" -f $color, $mark, $t.Status, $title, $ok.Count, $targets.Count, $failed.Count, $extra, $Clr.Reset, $logHint)
     }
     return $changed
 }
-
 $onTick = { Update-Jobs }
 $banner = {
     $lines = @()
@@ -365,19 +393,56 @@ function Invoke-SetStatus {
     )
     if ($detail) { $lines += $detail }
     $lines += "Resources  : $($targets.Count) will be updated" + $(if ($already) { ", $already already $Status (skipped)" } else { '' })
+
+    # Other loaded recommendations on the same resources with the same type: Azure may change them too.
+    $keys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($r in $targets) { $null = $keys.Add(('{0}|{1}' -f $r.ResourceId, $r.RecommendationTypeId)) }
+    $siblings = @(foreach ($rec in $state.Recommendations) {
+        if ($rec -eq $Recommendation) { continue }
+        foreach ($r in $rec.Resources) { if ($r.RecommendationTypeId -and $keys.Contains(('{0}|{1}' -f $r.ResourceId, $r.RecommendationTypeId))) { $r } }
+    })
+    if ($siblings) {
+        $lines += "$($Clr.Warn)Note: $($siblings.Count) other recommendation(s) on the same resource(s) share this recommendation type.$($Clr.Reset)"
+        $lines += "$($Clr.Warn)      Azure may change them as well - the tool re-reads and reports them.$($Clr.Reset)"
+    }
     $lines += ''
-    $lines += "$($Clr.Muted)The update runs in the background - you can keep triaging. Resources that no longer exist are skipped and reported.$($Clr.Reset)"
+    $lines += "$($Clr.Muted)The update runs in the background - you can keep triaging. Every resource is re-read afterwards, so the result reflects the real status.$($Clr.Reset)"
     if (-not (Read-RtConfirm -Title 'Confirm status change' -Lines $lines -Question "Set $($targets.Count) resource(s) to $Status in Azure Advisor?")) { return }
 
     try {
         $job = Start-RtStatusUpdateJob -Token (Get-Token) -Recommendation $Recommendation -Resource $targets -Status $Status `
-            -DismissReason $reason -PostponedUntil $until -Demo:$Demo
+            -DismissReason $reason -PostponedUntil $until -Sibling $siblings -Demo:$Demo
         $state.Jobs.Add($job)
         Add-Notice ("$($Clr.Accent)» Started: {0} · {1} ({2} resource(s))$($Clr.Reset)" -f $Status, (Format-RtCell $Recommendation.Title 48).Trim(), $targets.Count)
     }
     catch {
         Show-RtMessage -Title 'Error' -Lines @("$($Clr.Error)Could not start the update: $($_.Exception.Message)$($Clr.Reset)")
     }
+}
+
+function Select-StatusAction {
+    <# Status picker for one recommendation: returns 'Postponed', 'Completed', 'Dismissed', 'Details' or $null. #>
+    param([object]$Recommendation)
+    $r = $Recommendation
+    $header = {
+        & $banner
+        "$($Clr.Bold)$($r.Title)$($Clr.Reset)"
+        ("Priority: {0}{1}{2}   Current status: {3}{4}{2}   Resources: {5}" -f (Get-RtPriorityCell $r.Priority), $r.Priority, $Clr.Reset,
+            (Get-RtStatusColor $r.Status), $(if ($r.IsMixed) { "$($r.Status) (mixed)" } else { $r.Status }), $r.Resources.Count)
+        "Resource status: $(Format-RtCounts $r.StatusCounts)"
+        "$($Clr.Muted)Review: $($r.ReviewName)$($Clr.Reset)"
+        ''
+        'Change the status of all resources of this recommendation to:'
+    }
+    $states = @('Completed', 'Postponed', 'Dismissed')
+    $opts = @($states | ForEach-Object {
+        $n = @($r.Resources | Where-Object Status -ne $_).Count
+        if ($n) { '{0,-10} ({1} of {2} resource(s) will change)' -f $_, $n, $r.Resources.Count } else { '{0,-10} (current - all resources already {0})' -f $_ }
+    }) + 'Show details and impacted resources'
+    $i = Show-RtMenu -Title 'Set status' -Header $header -Option $opts -OnTick $onTick
+    if ($i -lt 0) { return $null }
+    if ($i -lt $states.Count) { return $states[$i] }
+    return 'Details'
 }
 
 function Invoke-Triage {
@@ -391,19 +456,20 @@ function Invoke-Triage {
             @{ Header = 'Priority'; Width = 13; Value = { param($r) "● $($r.Priority)" }; Color = { param($r) Get-RtPriorityCell $r.Priority } }
             @{ Header = 'Status'; Width = 11; Value = { param($r) if ($r.IsMixed) { "$($r.Status)*" } else { $r.Status } }; Color = { param($r) Get-RtStatusColor $r.Status } }
             @{ Header = 'Res.'; Width = 5; Value = { param($r) $r.Resources.Count.ToString().PadLeft(4) } }
-            @{ Header = 'Recommendation'; Flex = 4; Value = { param($r) $r.Title } }
+            @{ Header = 'Recommendation'; Flex = 5; Value = { param($r) $r.Title } }
             @{ Header = 'Description'; Flex = 3; Value = { param($r) $r.Description }; Color = { param($r) Get-RtColor 'Muted' } }
         )
-        if ($multiReview) { $cols += @{ Header = 'Review'; Flex = 2; Value = { param($r) $r.ReviewName } } }
+        if ($multiReview) { $cols += @{ Header = 'Review'; Flex = 2; Value = { param($r) $r.ReviewName }; Color = { param($r) Get-RtColor 'Muted' } } }
 
-        $pick = Show-RtFilterList -Title 'Triage recommendations' -Item $items -Column $cols -Filter $state.Filter -Index $state.ListIndex `
-            -Banner { & $banner; "$(Get-RtColor 'Muted')* = resources of this recommendation have different states$(Get-RtColor 'Reset')" } -OnTick $onTick `
-            -SearchText { param($r) '{0} {1} {2} {3} {4} {5}' -f $r.Title, $r.Description, $r.Priority, $r.Status, $r.ReviewName, $r.WorkloadName }
+        $pick = Show-RtFilterList -Title "Recommendations ($($items.Count)) - type to search titles" -Item $items -Column $cols -Filter $state.Filter -Index $state.ListIndex `
+            -Banner { & $banner; "$(Get-RtColor 'Muted')Enter = change status of all resources   * = resources have different states$(Get-RtColor 'Reset')" } -OnTick $onTick `
+            -SearchText { param($r) $r.Title }
         if ($null -eq $pick) { $state.Filter = ''; $state.ListIndex = 0; return }
         $state.Filter = $pick.Filter
         $state.ListIndex = $pick.Index
 
-        $action = Show-RtRecommendationDetail -Recommendation $pick.Item -Banner $banner -OnTick $onTick
+        $action = Select-StatusAction -Recommendation $pick.Item
+        if ($action -eq 'Details') { $action = Show-RtRecommendationDetail -Recommendation $pick.Item -Banner $banner -OnTick $onTick }
         if ($action) { Invoke-SetStatus -Recommendation $pick.Item -Status $action }
     }
 }
@@ -443,7 +509,7 @@ try {
     Import-Recommendations
 
     $menu = @(
-        'Triage recommendations  (search, open, set Postponed / Completed / Dismissed)'
+        'Triage recommendations  (list all, search by title, set Completed / Postponed / Dismissed)'
         'Export all recommendations  (CSV for task planner import)'
         'Export recommendations filtered by priority  (CSV)'
         'Reload data from Azure'
