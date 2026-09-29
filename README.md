@@ -11,7 +11,7 @@
 > - **ThreadJob** module for background updates (included with PowerShell 7)
 > - A terminal with ANSI/VT and UTF-8 support, a wide window works best, e.g. 120+ columns (Windows Terminal recommended)
 > - Azure RBAC: **Reader** to view reviews. To change statuses you need write access to `Microsoft.Advisor/recommendations`, for example **Advisor Recommendations Contributor** or **Contributor**.
-> - Network access to `management.azure.com` (Advisor and Resource Graph REST APIs; no other Az modules needed)
+> - Network access to `management.azure.com` (Advisor and Resource Graph REST APIs; no other Az modules needed). Behind a corporate proxy the tool authenticates with your Windows user automatically (see [Proxy](#proxy)).
 
 A PowerShell TUI (text user interface) for the **resiliency reviews** your Microsoft account team shares with you in [Azure Advisor](https://learn.microsoft.com/azure/advisor/advisor-resiliency-reviews). With it you can:
 
@@ -61,6 +61,20 @@ cd .\ResiliencyReviewBuddy
 | `-UseDeviceAuthentication` | Device code sign-in |
 | `-ExportPath` | Folder for CSV exports and failure logs (default `.\exports`) |
 | `-Demo` | Offline demo mode |
+| `-Proxy` | Proxy URL, when the system proxy is not the right one (default: system proxy incl. PAC) |
+| `-ProxyCredential` | Explicit proxy credential when your Windows user is not accepted |
+
+### Proxy
+
+PowerShell 7 uses the system proxy but does not log on to it, which ends in `HTTP 407 Proxy Authentication Required`. The tool therefore sets the process-wide proxy credentials to your **signed-in Windows user** (Kerberos / NTLM via `Negotiate`) before the first web call. This covers sign-in, the Advisor and Resource Graph calls and the background update jobs. The start screen shows the detected proxy.
+
+```powershell
+# Use a specific proxy (still authenticated as your Windows user)
+.\Start-ResiliencyTriage.ps1 -Proxy http://proxy.contoso.com:8080
+
+# Proxy wants a different account (e.g. Basic auth)
+.\Start-ResiliencyTriage.ps1 -ProxyCredential (Get-Credential)
+```
 
 ### Keys
 

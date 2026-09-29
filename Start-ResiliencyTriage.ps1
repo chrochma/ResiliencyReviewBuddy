@@ -28,6 +28,13 @@
 .PARAMETER Demo
     Runs with fictional data and simulated updates - no Azure access needed.
 
+.PARAMETER Proxy
+    Proxy URL (e.g. http://proxy.contoso.com:8080). Default: the system proxy (incl. PAC).
+    Either way the proxy is authenticated with your Windows user (Kerberos/NTLM).
+
+.PARAMETER ProxyCredential
+    Credential for the proxy when your Windows user is not accepted.
+
 .EXAMPLE
     .\Start-ResiliencyTriage.ps1
 
@@ -43,7 +50,9 @@ param(
     [string[]]$SubscriptionId,
     [switch]$UseDeviceAuthentication,
     [string]$ExportPath = (Join-Path $PSScriptRoot 'exports'),
-    [switch]$Demo
+    [switch]$Demo,
+    [string]$Proxy,
+    [pscredential]$ProxyCredential
 )
 
 Set-StrictMode -Version Latest
@@ -75,6 +84,13 @@ if ($Demo) {
     $ctx = [pscustomobject]@{ Account = 'demo@contoso.com'; TenantId = '00000000-0000-0000-0000-000000000000'; SubscriptionName = 'demo'; SubscriptionId = '' }
 }
 else {
+    # Authenticate to a corporate proxy with the user context before any web call (HTTP 407).
+    $proxyUri = Set-RtProxy -Proxy $Proxy -Credential $ProxyCredential
+    if ($proxyUri) {
+        $who = if ($ProxyCredential) { $ProxyCredential.UserName } else { "$env:USERDOMAIN\$env:USERNAME" }
+        Write-Host ("  Proxy        : {0} (authenticating as {1})" -f $proxyUri, $who) -ForegroundColor DarkGray
+        Write-Host ''
+    }
     Assert-RtAzModule
     $ctx = Get-RtAzContextInfo
     if ($ctx) {

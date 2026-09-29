@@ -84,6 +84,38 @@ function Get-RtResourceGroupFromId {
 
 #region Authentication / token
 
+function Set-RtProxy {
+    <#
+    .SYNOPSIS
+        Lets every web call of this process authenticate to a proxy (fixes HTTP 407).
+    .DESCRIPTION
+        PowerShell 7 picks up the system proxy (incl. PAC) but does not send credentials to it.
+        This sets the process-wide default proxy credentials to the signed-in Windows user
+        (Kerberos/NTLM), or to -Credential. Parallel runspaces and thread jobs share it.
+    .OUTPUTS
+        The proxy URI used for Azure Resource Manager, or $null when no proxy applies.
+    #>
+    param([string]$Proxy, [pscredential]$Credential)
+    $cred = if ($Credential) { $Credential.GetNetworkCredential() } else { [System.Net.CredentialCache]::DefaultNetworkCredentials }
+    if ($Proxy) {
+        $wp = [System.Net.WebProxy]::new($Proxy, $true)
+        $wp.Credentials = $cred
+        [System.Net.Http.HttpClient]::DefaultProxy = $wp
+    }
+    $default = [System.Net.Http.HttpClient]::DefaultProxy
+    $default.Credentials = $cred
+    # Legacy WebRequest stack (used by some modules, e.g. PowerShellGet v2).
+    try { [System.Net.WebRequest]::DefaultWebProxy = $default } catch { }
+
+    $target = [uri]'https://management.azure.com/'
+    try {
+        if ($default.IsBypassed($target)) { return $null }
+        $used = $default.GetProxy($target)
+        if ($used -and $used.Host -ne $target.Host) { return $used }
+    } catch { }
+    return $null
+}
+
 function Assert-RtAzModule {
     <# Makes sure Az.Accounts is present and imported; offers an install when missing. #>
     if (-not (Get-Module -ListAvailable -Name Az.Accounts)) {
@@ -163,7 +195,11 @@ function Invoke-RtArm {
             $attempt++
             $req = @{ Uri = $uri; Method = $Method; Headers = $headers; SkipHttpErrorCheck = $true; ErrorAction = 'Stop'; TimeoutSec = 100 }
             if ($payload) { $req['Body'] = $payload; $req['ContentType'] = 'application/json' }
-            $resp = Invoke-WebRequest @req
+            try { $resp = Invoke-WebRequest @req }
+            catch {
+                if ("$_" -match '407') { throw "Proxy authentication failed (HTTP 407). Your Windows user was rejected by the proxy - run again with -ProxyCredential (Get-Credential) or -Proxy <url>. Details: $_" }
+                throw
+            }
             $code = [int]$resp.StatusCode
             if (($code -eq 429 -or $code -ge 500) -and $attempt -le 4) {
                 $wait = 2 * $attempt
@@ -917,7 +953,7 @@ function New-RtDemoData {
 
 Export-ModuleMember -Function @(
     'Get-RtProp', 'Get-RtDismissReason', 'Get-RtPriorityRank', 'ConvertTo-RtStatusBucket',
-    'Assert-RtAzModule', 'Get-RtAzContextInfo', 'Connect-RtAzure', 'Get-RtArmToken',
+    'Set-RtProxy', 'Assert-RtAzModule', 'Get-RtAzContextInfo', 'Connect-RtAzure', 'Get-RtArmToken',
     'Invoke-RtArm', 'Get-RtSubscription', 'Invoke-RtGraphQuery',
     'Get-RtReview', 'Get-RtReviewRecommendation', 'Get-RtGraphReviewRecommendation', 'Merge-RtRecommendationSource', 'Get-RtResourceTypeFromId', 'ConvertTo-RtRecommendation', 'Update-RtRecommendationStatus', 'Merge-RtDuplicateRecommendation',
     'Get-RtSummary', 'Export-RtRecommendation',

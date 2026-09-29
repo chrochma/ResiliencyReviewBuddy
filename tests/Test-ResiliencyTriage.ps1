@@ -160,6 +160,13 @@ Assert-That ((Format-RtCell 'ab' 4) -eq 'ab  ') 'Format-RtCell pads'
 $wrap = Split-RtWrap 'one two three four five six seven' 10 2
 Assert-That ($wrap.Count -eq 2 -and $wrap[-1].EndsWith('…')) 'Split-RtWrap limits lines'
 
+Write-Host 'Proxy' -ForegroundColor Cyan
+$px = Set-RtProxy -Proxy 'http://127.0.0.1:3128'
+Assert-That ($px -and $px.Port -eq 3128) 'explicit proxy used for ARM'
+Assert-That ([System.Net.Http.HttpClient]::DefaultProxy.Credentials -eq [System.Net.CredentialCache]::DefaultNetworkCredentials) 'proxy authenticates with the Windows user'
+$null = Set-RtProxy -Proxy 'http://127.0.0.1:3128' -Credential ([pscredential]::new('bob', (ConvertTo-SecureString 'pw' -AsPlainText -Force)))
+Assert-That ([System.Net.Http.HttpClient]::DefaultProxy.Credentials.UserName -eq 'bob') 'explicit proxy credential'
+
 Write-Host ''
 if ($script:failures) { Write-Host "$($script:failures) test(s) failed." -ForegroundColor Red; exit 1 }
 Write-Host 'All tests passed.' -ForegroundColor Green
