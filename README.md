@@ -4,6 +4,15 @@
 
 # Resiliency Review Buddy
 
+> [!IMPORTANT]
+> **Requirements**
+> - **PowerShell 7.2 or later** (`pwsh`). Windows PowerShell 5.1 is **not** supported. Install: `winget install Microsoft.PowerShell`
+> - **Az.Accounts** module for sign-in and tokens: `Install-Module Az.Accounts -Scope CurrentUser` (the tool offers to install it if missing)
+> - **ThreadJob** module for background updates (included with PowerShell 7)
+> - A terminal with ANSI/VT and UTF-8 support, a wide window works best, e.g. 120+ columns (Windows Terminal recommended)
+> - Azure RBAC: **Reader** to view reviews. To change statuses you need write access to `Microsoft.Advisor/recommendations`, for example **Advisor Recommendations Contributor** or **Contributor**.
+> - Network access to `management.azure.com` (Advisor and Resource Graph REST APIs; no other Az modules needed)
+
 A PowerShell TUI (text user interface) for the **resiliency reviews** your Microsoft account team shares with you in [Azure Advisor](https://learn.microsoft.com/azure/advisor/advisor-resiliency-reviews). With it you can:
 
 - track the progress of one, several or all reviews at once,
