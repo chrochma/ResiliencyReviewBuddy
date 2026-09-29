@@ -35,8 +35,8 @@
 .PARAMETER ProxyCredential
     Credential for the proxy when your Windows user is not accepted.
 
-.PARAMETER LargeReviewThreshold
-    Resource-level items above which a review selection asks for confirmation before loading (default 25000).
+.PARAMETER LargeLoadThreshold
+    Resources above which the tool asks before loading the resources of a recommendation (default 10000).
 
 .EXAMPLE
     .\Start-ResiliencyTriage.ps1
@@ -56,7 +56,7 @@ param(
     [switch]$Demo,
     [string]$Proxy,
     [pscredential]$ProxyCredential,
-    [int]$LargeReviewThreshold = 25000
+    [int]$LargeLoadThreshold = 10000
 )
 
 Set-StrictMode -Version Latest
@@ -139,6 +139,9 @@ $state = [pscustomobject]@{
     FailedSubs      = @()
     SelectedReviews = @()
     Recommendations = @()
+    Verified        = @{}   # recommendation ARM ID -> status verified in this session
+    VerifiedKeys    = [System.Collections.Generic.HashSet[string]]::new()
+    DemoResources   = @{}
     Jobs            = [System.Collections.Generic.List[object]]::new()
     Notices         = [System.Collections.Generic.List[string]]::new()
     History         = [System.Collections.Generic.List[string]]::new()
@@ -208,48 +211,85 @@ function Select-Reviews {
         for ($i = 0; $i -lt $state.AllReviews.Count; $i++) { if ($state.AllReviews[$i].ReviewId -in $state.SelectedReviews.ReviewId) { $pre += $i } }
     }
     elseif ($state.AllReviews.Count -eq 1) { $pre = @(0) }
-    while ($true) {
-        $picked = Show-RtCheckList -Title 'Select reviews' -Item $state.AllReviews -Column $cols -Lines $intro -Preselect $pre -RequireSelection
-        if ($null -eq $picked) { return $false }
-        # Every affected resource is one Advisor item that has to be downloaded.
-        $items = (@($picked | ForEach-Object { if ($_.PSObject.Properties['ItemCount'] -and $_.ItemCount) { [int]$_.ItemCount } else { 0 } }) | Measure-Object -Sum).Sum
-        if ($items -le $LargeReviewThreshold) { break }
-        $big = @($picked | Where-Object { $_.PSObject.Properties['ItemCount'] -and $_.ItemCount -gt 5000 } | ForEach-Object { "  - $($_.ReviewName): {0:n0} resource item(s)" -f $_.ItemCount })
-        $minutes = [Math]::Ceiling($items / 1000 * 2 / 60)
-        $lines = @(
-            "$($Clr.Warn)The selection contains {0:n0} resource-level Advisor items.$($Clr.Reset)" -f $items
-            ''
-        ) + $big + @(
-            ''
-            "Loading them can take $minutes+ minute(s) and a lot of memory."
-            'Tip: select the large review on its own, or run again with -SubscriptionId to narrow the scope.'
-        )
-        if (Read-RtConfirm -Title 'Large selection' -Lines $lines -Question 'Load anyway?' -Default $false) { break }
-        $pre = @(for ($i = 0; $i -lt $state.AllReviews.Count; $i++) { if ($state.AllReviews[$i].ReviewId -in $picked.ReviewId) { $i } })
-    }
+    $picked = Show-RtCheckList -Title 'Select reviews' -Item $state.AllReviews -Column $cols -Lines $intro -Preselect $pre -RequireSelection
+    if ($null -eq $picked) { return $false }
     $state.SelectedReviews = @($picked)
     Update-ContextLine
     return $true
 }
 
 function Import-Recommendations {
+    <# Loads recommendations with resource counts only; resources follow on demand (Import-Resources). #>
     if ($Demo) {
         $raw = $state.DemoData.Raw
         $reviews = $state.SelectedReviews
-        $state.Recommendations = @(Invoke-RtBusy -Title 'Loading' -Message 'Loading review recommendations (demo)…' -ModulePath $azModule `
+        $full = @(Invoke-RtBusy -Title 'Loading' -Message 'Loading review recommendations (demo)…' -ModulePath $azModule `
             -ArgumentList $raw, $reviews -ScriptBlock {
                 param($Raw, $Reviews)
                 Start-Sleep -Milliseconds 600
                 ConvertTo-RtRecommendation -RawRecommendation $Raw -Review $Reviews
             })
-        return
+        # Same shape as online: counts now, resources later.
+        $state.DemoResources = @{}
+        foreach ($rec in $full) {
+            $state.DemoResources[$rec.Key] = $rec.Resources
+            $rec.StatusCounts = [pscustomobject][ordered]@{ Active = $rec.StatusCounts.Active; Postponed = $rec.StatusCounts.Postponed; Completed = $rec.StatusCounts.Completed; Dismissed = $rec.StatusCounts.Dismissed }
+            $rec.Resources = [System.Collections.Generic.List[object]]::new()
+            $rec.ResourcesLoaded = $false
+        }
+        $state.Recommendations = @($full | ForEach-Object { $_ })
     }
-    $scan = @($state.Subscriptions.SubscriptionId)
-    $state.Recommendations = @(Invoke-RtBusy -Title 'Loading' -Message "Loading recommendations of $($state.SelectedReviews.Count) review(s)…" -ModulePath $azModule `
-        -ArgumentList (Get-Token), $state.SelectedReviews, $scan -ScriptBlock {
-            param($Token, $Reviews, $Scan)
-            Get-RtReviewRecommendation -Token $Token -Review $Reviews -ScanSubscription $Scan
-        })
+    else {
+        $scan = @($state.Subscriptions.SubscriptionId)
+        $state.Recommendations = @(Invoke-RtBusy -Title 'Loading' -Message "Loading recommendations of $($state.SelectedReviews.Count) review(s)…" -ModulePath $azModule `
+            -ArgumentList (Get-Token), $state.SelectedReviews, $scan -ScriptBlock {
+                param($Token, $Reviews, $Scan)
+                Get-RtRecommendationSummary -Token $Token -Review $Reviews -ScanSubscription $Scan
+            })
+    }
+    # Resource Graph lags a few minutes: reload resources changed in this session and keep the verified status.
+    $changed = @($state.Recommendations | Where-Object { $state.VerifiedKeys.Contains($_.Key) })
+    if ($changed) { $null = Import-Resources -Recommendation $changed -NoConfirm }
+}
+
+function Import-Resources {
+    <# Loads the affected resources of recommendations that only have counts yet. Returns $false if cancelled. #>
+    param([object[]]$Recommendation, [switch]$NoConfirm)
+    $todo = @($Recommendation | Where-Object { -not $_.ResourcesLoaded })
+    if (-not $todo) { return $true }
+    $n = [int](($todo | Measure-Object ResourceCount -Sum).Sum)
+    if (-not $NoConfirm -and $n -gt $LargeLoadThreshold) {
+        $minutes = [Math]::Ceiling($n / 1000 * 4 / 60)
+        $lines = @(
+            ("$($Clr.Warn){0:n0} affected resources have to be loaded for this change.$($Clr.Reset)" -f $n)
+            ''
+            "This takes about $minutes minute(s). The status change itself then updates every resource."
+        )
+        if (-not (Read-RtConfirm -Title 'Large recommendation' -Lines $lines -Question 'Load the resources?' -Default $true)) { return $false }
+    }
+    if ($Demo) {
+        $null = Invoke-RtBusy -Title 'Loading' -Message ("Loading {0:n0} affected resource(s) (demo)…" -f $n) -ScriptBlock { Start-Sleep -Milliseconds 400 }
+        $loaded = @($todo | ForEach-Object { [pscustomobject]@{ Key = $_.Key; Resources = @($state.DemoResources[$_.Key]) } })
+    }
+    else {
+        $scan = @($state.Subscriptions.SubscriptionId)
+        $loaded = @(Invoke-RtBusy -Title 'Loading' -Message ("Loading {0:n0} affected resource(s)…" -f $n) -ModulePath $azModule `
+            -ArgumentList (Get-Token), $todo, $state.SelectedReviews, $scan -ScriptBlock {
+                param($Token, $Recs, $Reviews, $Scan)
+                Get-RtRecommendationResource -Token $Token -Recommendation $Recs -Review $Reviews -ScanSubscription $Scan
+            })
+    }
+    Set-RtRecommendationResource -Target @($state.Recommendations) -Loaded $loaded -Requested $todo
+    # Keep statuses verified in this session (Resource Graph may still show the old one).
+    foreach ($rec in $todo) {
+        $hit = $false
+        foreach ($res in $rec.Resources) {
+            $v = $state.Verified[([string]$res.RecommendationArmId).ToLowerInvariant()]
+            if ($v) { $res.RawStatus = $v; $res.Status = ConvertTo-RtStatusBucket $v; $hit = $true }
+        }
+        if ($hit) { Update-RtRecommendationStatus -Recommendation $rec }
+    }
+    return $true
 }
 
 function Get-FriendlyReason { param([string]$Reason) ($Reason -creplace '([a-z])([A-Z])', '$1 $2') }
@@ -300,6 +340,8 @@ function Update-Jobs {
             $actual = [string]$r.ActualStatus
             if (-not $actual -and $r.Kind -eq 'Target' -and $r.Success) { $actual = $t.Status }
             if (-not $actual) { continue }
+            $state.Verified[([string]$e.Resource.RecommendationArmId).ToLowerInvariant()] = $actual
+            $null = $state.VerifiedKeys.Add($e.Recommendation.Key)
             $bucket = ConvertTo-RtStatusBucket $actual
             if ($r.Kind -eq 'Sibling' -and $bucket -ne $e.Resource.Status) { $siblingChanged++ }
             $e.Resource.Status = $bucket; $e.Resource.RawStatus = $actual
@@ -377,6 +419,14 @@ function Invoke-Export {
         if ($p -notmatch '\.csv$') { return 'The file name must end with .csv' }
     }
     if (-not $path) { return }
+    $set = @($recs | Where-Object { (-not $priorities -or $_.Priority -in $priorities) -and (-not $statuses -or $_.Status -in $statuses) })
+    $missing = @($set | Where-Object { -not $_.ResourcesLoaded })
+    if ($missing) {
+        $n = [int](($missing | Measure-Object ResourceCount -Sum).Sum)
+        $q = Read-RtConfirm -Title 'Export' -Lines @(('The CSV always contains the resource counts. Listing the resource IDs requires loading {0:n0} resource(s) first.' -f $n)) `
+            -Question 'Include the impacted resource IDs?' -Default ($n -le $LargeLoadThreshold)
+        if ($q -and -not (Import-Resources -Recommendation $missing -NoConfirm)) { return }
+    }
     try {
         $res = Export-RtRecommendation -Recommendation $recs -Path $path -Priority $priorities -Status $statuses
         Show-RtMessage -Title 'Export' -Lines @(
@@ -480,17 +530,18 @@ function Select-StatusAction {
         & $banner
         "$($Clr.Bold)$($r.Title)$($Clr.Reset)"
         ("Priority: {0}{1}{2}   Current status: {3}{4}{2}   Resources: {5}" -f (Get-RtPriorityCell $r.Priority), $r.Priority, $Clr.Reset,
-            (Get-RtStatusColor $r.Status), $(if ($r.IsMixed) { "$($r.Status) (mixed)" } else { $r.Status }), $r.Resources.Count)
+            (Get-RtStatusColor $r.Status), $(if ($r.IsMixed) { "$($r.Status) (mixed)" } else { $r.Status }), $r.ResourceCount)
         "Resource status: $(Format-RtCounts $r.StatusCounts)"
         "$($Clr.Muted)Review: $($r.ReviewName)$($Clr.Reset)"
         if ($r.OtherReviews.Count) { "$($Clr.Muted)Also in: $($r.OtherReviews -join ', ') (updated together)$($Clr.Reset)" }
+        if (-not $r.ResourcesLoaded) { "$($Clr.Muted)Counts from Resource Graph - the affected resources are loaded when you pick a status or the details.$($Clr.Reset)" }
         ''
         'Change the status of all resources of this recommendation to:'
     }
     $states = @('Completed', 'Postponed', 'Dismissed')
     $opts = @($states | ForEach-Object {
-        $n = @($r.Resources | Where-Object Status -ne $_).Count
-        if ($n) { '{0,-10} ({1} of {2} resource(s) will change)' -f $_, $n, $r.Resources.Count } else { '{0,-10} (current - all resources already {0})' -f $_ }
+        $n = $r.ResourceCount - [int]$r.StatusCounts.$_
+        if ($n) { '{0,-10} ({1:n0} of {2:n0} resource(s) will change)' -f $_, $n, $r.ResourceCount } else { '{0,-10} (current - all resources already {0})' -f $_ }
     }) + 'Show details and impacted resources'
     $i = Show-RtMenu -Title 'Set status' -Header $header -Option $opts -OnTick $onTick
     if ($i -lt 0) { return $null }
@@ -504,12 +555,12 @@ function Invoke-Triage {
         # Critical first, then High, Medium, Low; open work before closed work.
         $statusRank = @{ Active = 0; Postponed = 1; Dismissed = 2; Completed = 3 }
         $views = @(Merge-RtDuplicateRecommendation -Recommendation @($state.Recommendations) -Review @($state.SelectedReviews))
-        $items = @($views | Sort-Object PriorityRank, @{ Expression = { $statusRank[$_.Status] } }, @{ Expression = { $_.Resources.Count }; Descending = $true }, Title)
+        $items = @($views | Sort-Object PriorityRank, @{ Expression = { $statusRank[$_.Status] } }, @{ Expression = { $_.ResourceCount }; Descending = $true }, Title)
         if (-not $items) { Show-RtMessage -Title 'Triage' -Lines @('The selected reviews have no recommendations.'); return }
         $cols = @(
             @{ Header = 'Priority'; Width = 13; Value = { param($r) "● $($r.Priority)" }; Color = { param($r) Get-RtPriorityCell $r.Priority } }
             @{ Header = 'Status'; Width = 11; Value = { param($r) if ($r.IsMixed) { "$($r.Status)*" } else { $r.Status } }; Color = { param($r) Get-RtStatusColor $r.Status } }
-            @{ Header = 'Res.'; Width = 5; Value = { param($r) $r.Resources.Count.ToString().PadLeft(4) } }
+            @{ Header = 'Res.'; Width = 7; Value = { param($r) ('{0:n0}' -f $r.ResourceCount).PadLeft(6) } }
             @{ Header = 'Recommendation'; Flex = 5; Value = { param($r) $r.Title } }
             @{ Header = 'Review'; Flex = 3; Value = { param($r) if ($r.OtherReviews.Count) { "(+$($r.OtherReviews.Count)) $($r.ReviewName)" } else { $r.ReviewName } } }
             @{ Header = 'Description'; Flex = 2; Value = { param($r) $r.Description }; Color = { param($r) Get-RtColor 'Muted' } }
@@ -523,8 +574,12 @@ function Invoke-Triage {
         $state.ListIndex = $pick.Index
 
         $action = Select-StatusAction -Recommendation $pick.Item
-        if ($action -eq 'Details') { $action = Show-RtRecommendationDetail -Recommendation $pick.Item -Banner $banner -OnTick $onTick }
-        if ($action) { Invoke-SetStatus -Recommendation $pick.Item -Status $action }
+        if (-not $action) { continue }
+        if (-not (Import-Resources -Recommendation @($pick.Item.Members))) { continue }
+        # Rebuild the row from the now loaded copies (all reviews).
+        $view = @(Merge-RtDuplicateRecommendation -Recommendation @($pick.Item.Members) -Review @($state.SelectedReviews))[0]
+        if ($action -eq 'Details') { $action = Show-RtRecommendationDetail -Recommendation $view -Banner $banner -OnTick $onTick }
+        if ($action) { Invoke-SetStatus -Recommendation $view -Status $action }
     }
 }
 

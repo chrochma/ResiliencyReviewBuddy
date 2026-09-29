@@ -466,7 +466,7 @@ advisorresources
 | where type =~ 'microsoft.advisor/recommendations'
 | where isnotempty(properties.review)
 | extend rid = tostring(properties.review.id), rname = tostring(properties.review.name)
-| summarize items = count(), recs = dcount(tostring(properties.label)), subs = make_set(subscriptionId, 20), workload = take_any(tostring(properties.resourceWorkload.name)) by rid, rname
+| summarize recs = dcount(tostring(properties.label)), subs = make_set(subscriptionId, 20), workload = take_any(tostring(properties.resourceWorkload.name)) by rid, rname
 "@
             $refs = @(Invoke-RtGraphQuery -Token $Token -SubscriptionId $ids -Query $query)
             $added = 0
@@ -493,7 +493,19 @@ advisorresources
                 Write-RtLog "Review '$($ref.rname)' found only via its recommendations (review resource not readable)" -Level WARN
             }
             Write-RtLog "Recommendations reference $($refs.Count) review(s), $added not found before"
-            # Resource-level item count per review: very large reviews take long to load.
+            # Affected resources per review, counted like the summary (legacy copies once).
+            $itemQuery = @"
+advisorresources
+| where type =~ 'microsoft.advisor/recommendations'
+| where isnotempty(properties.review)
+| extend rid = tostring(properties.review.id), rname = tostring(properties.review.name)
+| extend label = tostring(properties.label), typeId = tostring(properties.recommendationTypeId), resId = tostring(properties.resourceMetadata.resourceId)
+| extend resKey = tolower(iff(isnotempty(resId), resId, extract('(?i)^(.+)/providers/microsoft\\.advisor/recommendations/', 1, id)))
+| extend resKey = iff(isempty(resKey), tolower(id), resKey), groupKey = iff(isempty(label), name, label)
+| summarize by rid, rname, typeId, groupKey, resKey
+| summarize items = count() by rid, rname
+"@
+            $refs = @(Invoke-RtGraphQuery -Token $Token -SubscriptionId $ids -Query $itemQuery)
             foreach ($rv in $byId.Values) {
                 $n = 0
                 foreach ($ref in $refs) {
@@ -514,6 +526,26 @@ advisorresources
 
 #region Recommendations
 
+function ConvertTo-RtKqlString {
+    <# Quoted KQL string literal. #>
+    param([string]$Value)
+    "'" + ([string]$Value).Replace('\', '\\').Replace("'", "\'") + "'"
+}
+
+function Get-RtReviewFilterKql {
+    <# KQL lines that add rid / rname and keep only rows of the given reviews (by review ID or name). #>
+    param([object[]]$Review = @())
+    $out = "| extend rid = tostring(properties.review.id), rname = tostring(properties.review.name)`n"
+    if (-not $Review) { return $out }
+    $ids = @($Review | Where-Object ReviewId | ForEach-Object { ConvertTo-RtKqlString $_.ReviewId.ToLowerInvariant() }) -join ', '
+    $names = @($Review | Where-Object ReviewName | ForEach-Object { ConvertTo-RtKqlString $_.ReviewName }) -join ', '
+    $conds = @()
+    if ($ids) { $conds += "rid in~ ($ids)"; $conds += "tostring(split(rid, '/')[-1]) in~ ($ids)" }
+    if ($names) { $conds += "rname in~ ($names)" }
+    if ($conds) { $out += "| where $($conds -join ' or ')`n" }
+    return $out
+}
+
 function Get-RtGraphReviewRecommendation {
     <#
     .SYNOPSIS
@@ -522,23 +554,13 @@ function Get-RtGraphReviewRecommendation {
         The ARM list API omits title (label), description, benefits and notes of review
         recommendations; Resource Graph has them. Used to enrich the live ARM data.
     #>
-    param([Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string[]]$SubscriptionId, [object[]]$Review = @())
-    # Only rows of the selected reviews (by review ID or name) - big tenants hold many reviews.
-    $reviewFilter = ''
-    if ($Review) {
-        $q = { param($v) "'" + ([string]$v).Replace('\', '\\').Replace("'", "\'") + "'" }
-        $ids = @($Review | Where-Object ReviewId | ForEach-Object { & $q $_.ReviewId.ToLowerInvariant() }) -join ', '
-        $names = @($Review | Where-Object ReviewName | ForEach-Object { & $q $_.ReviewName }) -join ', '
-        $conds = @()
-        if ($ids) { $conds += "rid in~ ($ids)"; $conds += "tostring(split(rid, '/')[-1]) in~ ($ids)" }
-        if ($names) { $conds += "rname in~ ($names)" }
-        if ($conds) { $reviewFilter = "| extend rid = tostring(properties.review.id), rname = tostring(properties.review.name)`n| where $($conds -join ' or ')`n" }
-    }
+    param([Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string[]]$SubscriptionId, [object[]]$Review = @(), [string]$ItemFilter)
+    $extra = if ($ItemFilter) { "| where $ItemFilter`n" } else { '' }
     $query = @"
 advisorresources
 | where type =~ 'microsoft.advisor/recommendations'
 | where isnotempty(properties.review)
-$reviewFilter| project id, name, subscriptionId, properties
+$(Get-RtReviewFilterKql -Review $Review)$extra| project id, name, subscriptionId, properties
 "@
     @(Invoke-RtGraphQuery -Token $Token -Query $query -SubscriptionId $SubscriptionId)
 }
@@ -667,7 +689,11 @@ function ConvertTo-RtRecommendation {
                 RecommendationTypeId = $typeId
                 Priority             = $priority
                 PriorityRank         = Get-RtPriorityRank $priority
+                Label                = [string](Get-RtProp $p 'label')
+                ItemName             = if (Get-RtProp $p 'label') { '' } else { [string](Get-RtProp $raw 'name') }
                 Resources            = [System.Collections.Generic.List[object]]::new()
+                ResourcesLoaded      = $true
+                ResourceCount        = 0
                 Status               = 'Active'
                 IsMixed              = $false
                 StatusCounts         = $null
@@ -729,7 +755,10 @@ function Update-RtRecommendationStatus {
     <# Recomputes the aggregated status of a review recommendation from its resources. #>
     param([Parameter(Mandatory)][object]$Recommendation)
     $counts = [ordered]@{ Active = 0; Postponed = 0; Completed = 0; Dismissed = 0 }
-    foreach ($r in $Recommendation.Resources) { $counts[$r.Status]++ }
+    $loaded = -not $Recommendation.PSObject.Properties['ResourcesLoaded'] -or $Recommendation.ResourcesLoaded
+    if ($loaded) { foreach ($r in $Recommendation.Resources) { $counts[$r.Status]++ } }
+    elseif ($Recommendation.StatusCounts) { foreach ($k in @($counts.Keys)) { $counts[$k] = [int]$Recommendation.StatusCounts.$k } }
+    if ($Recommendation.PSObject.Properties['ResourceCount']) { $Recommendation.ResourceCount = [int](($counts.Values | Measure-Object -Sum).Sum) }
     $present = @($counts.Keys | Where-Object { $counts[$_] -gt 0 })
     $Recommendation.StatusCounts = [pscustomobject]$counts
     $Recommendation.IsMixed = $present.Count -gt 1
@@ -791,6 +820,194 @@ function Get-RtReviewRecommendation {
     return $result
 }
 
+function ConvertFrom-RtSummaryRow {
+    <#
+    .SYNOPSIS
+        Builds review recommendations (counts only, no resources) from the Resource Graph summary.
+    .PARAMETER CountRow
+        rid, rname, typeId, label, groupKey, st, n  (one row per recommendation and raw status)
+    .PARAMETER TextRow
+        rid, rname, typeId, label, groupKey + text columns (one row per recommendation)
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$CountRow,
+        [AllowEmptyCollection()][object[]]$TextRow = @(),
+        [Parameter(Mandatory)][object[]]$Review
+    )
+    $lookup = @{}
+    foreach ($r in $Review) {
+        if ($r.ReviewId) { $lookup["id:$($r.ReviewId.ToLowerInvariant())"] = $r; $lookup["name:$($r.ReviewId.ToLowerInvariant())"] = $r }
+        if ($r.ReviewName) { $lookup["name:$($r.ReviewName.ToLowerInvariant())"] = $r }
+    }
+    $rowKey = { param($x) ('{0}|{1}|{2}|{3}|{4}' -f $x.rid, $x.rname, $x.typeId, $x.label, $x.groupKey).ToLowerInvariant() }
+    $texts = @{}
+    foreach ($t in $TextRow) { $texts[(& $rowKey $t)] = $t }
+
+    $groups = [ordered]@{}
+    foreach ($c in $CountRow) {
+        $revId = ([string]$c.rid).TrimEnd('/').Split('/')[-1].ToLowerInvariant()
+        $revName = ([string]$c.rname).ToLowerInvariant()
+        $review = if ($revId -and $lookup.ContainsKey("id:$revId")) { $lookup["id:$revId"] } elseif ($revName -and $lookup.ContainsKey("name:$revName")) { $lookup["name:$revName"] } else { $null }
+        if (-not $review) { continue }
+        $label = [string]$c.label
+        $typeId = [string]$c.typeId
+        # Same key as ConvertTo-RtRecommendation, so loaded resources can be matched later.
+        $key = '{0}|{1}|{2}' -f $review.ReviewId, $typeId, $label
+        if (-not $label) { $key += '|' + [string]$c.groupKey }
+        if (-not $groups.Contains($key)) {
+            $t = $texts[(& $rowKey $c)]
+            $get = { param($n) if ($t -and $t.PSObject.Properties[$n]) { [string]$t.$n } else { '' } }
+            $title = if ($label) { $label } else { & $get 'problem' }
+            if (-not $title) { $title = '(untitled recommendation)' }
+            $priority = & $get 'priority'
+            if (-not $priority) { $priority = 'Medium' }
+            $description = & $get 'description'
+            if (-not $description) { $description = & $get 'solution' }
+            $groups[$key] = [pscustomobject]@{
+                Key                  = $key
+                ReviewId             = $review.ReviewId
+                ReviewName           = $review.ReviewName
+                WorkloadName         = $review.WorkloadName
+                Title                = $title
+                Description          = $description
+                PotentialBenefits    = & $get 'benefits'
+                Notes                = & $get 'notes'
+                LearnMoreLink        = & $get 'link'
+                Category             = & $get 'category'
+                RecommendationTypeId = $typeId
+                Priority             = $priority
+                PriorityRank         = Get-RtPriorityRank $priority
+                Label                = $label
+                ItemName             = if ($label) { '' } else { [string]$c.groupKey }
+                Resources            = [System.Collections.Generic.List[object]]::new()
+                ResourcesLoaded      = $false
+                ResourceCount        = 0
+                Status               = 'Active'
+                IsMixed              = $false
+                StatusCounts         = [pscustomobject][ordered]@{ Active = 0; Postponed = 0; Completed = 0; Dismissed = 0 }
+            }
+        }
+        $bucket = ConvertTo-RtStatusBucket ([string]$c.st)
+        $groups[$key].StatusCounts.$bucket += [int]$c.n
+    }
+    $list = @($groups.Values)
+    foreach ($rec in $list) { Update-RtRecommendationStatus -Recommendation $rec }
+    return @($list | Sort-Object PriorityRank, Title)
+}
+
+function Get-RtRecommendationSummary {
+    <#
+    .SYNOPSIS
+        Recommendations of the selected reviews with resource counts per status - no resources.
+    .DESCRIPTION
+        Two Resource Graph queries that aggregate on the server, so even reviews with hundreds of
+        thousands of affected resources load in seconds. Like the portal, a resource is counted once
+        (current object preferred over a legacy copy, then the most recently updated).
+        Resources are loaded on demand with Get-RtRecommendationResource.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Token,
+        [Parameter(Mandatory)][object[]]$Review,
+        [Parameter(Mandatory)][string[]]$ScanSubscription
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-RtLog "Loading recommendation summary of $(@($Review).Count) review(s): $((@($Review.ReviewName) -join ', '))"
+    $base = @"
+advisorresources
+| where type =~ 'microsoft.advisor/recommendations'
+| where isnotempty(properties.review)
+$(Get-RtReviewFilterKql -Review $Review)| extend label = tostring(properties.label), typeId = tostring(properties.recommendationTypeId)
+| extend groupKey = iff(isempty(label), name, label)
+"@
+    $countQuery = $base + @"
+
+| extend resId = tostring(properties.resourceMetadata.resourceId)
+| extend resKey = tolower(iff(isnotempty(resId), resId, extract('(?i)^(.+)/providers/microsoft\\.advisor/recommendations/', 1, id)))
+| extend resKey = iff(isempty(resKey), tolower(id), resKey)
+| extend st = coalesce(tostring(properties.recommendationStatus), tostring(properties.customerState), tostring(properties.trackedProperties.state), 'New')
+| extend rank = iff(isnotempty(tostring(properties.recommendationStatus)), 10000000000, 0) + coalesce(datetime_diff('second', todatetime(properties.lastUpdated), datetime(2000-01-01)), 0)
+| summarize arg_max(rank, st) by rid, rname, typeId, label, groupKey, resKey
+| summarize n = count() by rid, rname, typeId, label, groupKey, st
+"@
+    $textQuery = $base + @"
+
+| extend description = tostring(properties.description), solution = tostring(properties.shortDescription.solution), problem = tostring(properties.shortDescription.problem), benefits = tostring(properties.potentialBenefits), notes = tostring(properties.notes), link = tostring(properties.learnMoreLink), category = tostring(properties.category), priority = coalesce(tostring(properties.trackedProperties.priority), tostring(properties.priority), tostring(properties.impact))
+| summarize description = max(description), solution = max(solution), problem = max(problem), benefits = max(benefits), notes = max(notes), link = max(link), category = max(category), priority = max(priority) by rid, rname, typeId, label, groupKey
+"@
+    Write-RtLog 'Step 1/2: Resource Graph - resource counts per recommendation and status'
+    $counts = @(Invoke-RtGraphQuery -Token $Token -SubscriptionId $ScanSubscription -Query $countQuery)
+    Write-RtLog 'Step 2/2: Resource Graph - recommendation texts'
+    $texts = @(Invoke-RtGraphQuery -Token $Token -SubscriptionId $ScanSubscription -Query $textQuery)
+    $result = @(ConvertFrom-RtSummaryRow -CountRow $counts -TextRow $texts -Review $Review)
+    $total = ($result | ForEach-Object ResourceCount | Measure-Object -Sum).Sum
+    Write-RtLog ("Loaded {0} recommendation(s) with {1:n0} resource(s) in {2:n1}s" -f $result.Count, [int]$total, $sw.Elapsed.TotalSeconds)
+    return $result
+}
+
+function Get-RtRecommendationResource {
+    <#
+    .SYNOPSIS
+        Loads the affected resources of the given recommendations (Resource Graph).
+    .OUTPUTS
+        Recommendations with ResourcesLoaded = $true (same Key as the summary objects).
+        Other recommendations of the same reviews that happen to match are returned too.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Token,
+        [Parameter(Mandatory)][object[]]$Recommendation,
+        [Parameter(Mandatory)][object[]]$Review,
+        [Parameter(Mandatory)][string[]]$ScanSubscription
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $ids = @($Recommendation.ReviewId | Sort-Object -Unique)
+    $reviews = @($Review | Where-Object { $_.ReviewId -in $ids })
+    $expected = ($Recommendation | ForEach-Object { [int]$_.ResourceCount } | Measure-Object -Sum).Sum
+    Write-RtLog ("Loading {0:n0} resource(s) of {1} recommendation(s)" -f [int]$expected, @($Recommendation).Count)
+    $filter = ''
+    # Many recommendations -> load the whole reviews instead of a huge filter.
+    if (@($Recommendation).Count -le 200) {
+        $conds = @()
+        $labelled = @($Recommendation | Where-Object Label)
+        if ($labelled) {
+            $types = @($labelled.RecommendationTypeId | Sort-Object -Unique | ForEach-Object { ConvertTo-RtKqlString $_ }) -join ', '
+            $labels = @($labelled.Label | Sort-Object -Unique | ForEach-Object { ConvertTo-RtKqlString $_ }) -join ', '
+            $conds += "(tostring(properties.recommendationTypeId) in~ ($types) and tostring(properties.label) in~ ($labels))"
+        }
+        $names = @($Recommendation | Where-Object ItemName | ForEach-Object { ConvertTo-RtKqlString $_.ItemName }) -join ', '
+        if ($names) { $conds += "name in~ ($names)" }
+        if ($conds) { $filter = $conds -join ' or ' }
+    }
+    $rows = @(Get-RtGraphReviewRecommendation -Token $Token -SubscriptionId $ScanSubscription -Review $reviews -ItemFilter $filter)
+    $result = @(ConvertTo-RtRecommendation -RawRecommendation $rows -Review $reviews)
+    Write-RtLog ("Loaded {0:n0} resource row(s) in {1:n1}s" -f $rows.Count, $sw.Elapsed.TotalSeconds)
+    return $result
+}
+
+function Set-RtRecommendationResource {
+    <#
+    .SYNOPSIS
+        Copies loaded resources into the matching (summary) recommendations by Key.
+    .PARAMETER Requested
+        Recommendations that were asked for; they are marked loaded even if nothing came back.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Target,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Loaded,
+        [object[]]$Requested = @()
+    )
+    $byKey = @{}
+    foreach ($l in $Loaded) { $byKey[$l.Key] = $l }
+    $req = [System.Collections.Generic.HashSet[string]]::new([string[]]@($Requested | ForEach-Object Key))
+    foreach ($t in $Target) {
+        $l = $byKey[$t.Key]
+        if (-not $l -and -not $req.Contains($t.Key)) { continue }
+        $t.Resources = [System.Collections.Generic.List[object]]::new()
+        if ($l) { foreach ($r in $l.Resources) { $t.Resources.Add($r) } }
+        $t.ResourcesLoaded = $true
+        Update-RtRecommendationStatus -Recommendation $t
+    }
+}
+
 function Merge-RtDuplicateRecommendation {
     <#
     .SYNOPSIS
@@ -833,11 +1050,19 @@ function Merge-RtDuplicateRecommendation {
             Priority             = $p.Priority
             PriorityRank         = $p.PriorityRank
             Resources            = [System.Collections.Generic.List[object]]::new()
+            ResourcesLoaded      = -not @($members | Where-Object { $_.PSObject.Properties['ResourcesLoaded'] -and -not $_.ResourcesLoaded }).Count
+            ResourceCount        = 0
             Status               = 'Active'
             IsMixed              = $false
             StatusCounts         = $null
         }
-        foreach ($m in $members) { foreach ($r in $m.Resources) { $view.Resources.Add($r) } }
+        if ($view.ResourcesLoaded) { foreach ($m in $members) { foreach ($r in $m.Resources) { $view.Resources.Add($r) } } }
+        else {
+            # Summary only: add up the counts of all copies.
+            $sum = [ordered]@{ Active = 0; Postponed = 0; Completed = 0; Dismissed = 0 }
+            foreach ($m in $members) { foreach ($k in @($sum.Keys)) { $sum[$k] += [int]$m.StatusCounts.$k } }
+            $view.StatusCounts = [pscustomobject]$sum
+        }
         Update-RtRecommendationStatus -Recommendation $view
         $view
     }
@@ -894,7 +1119,7 @@ function Export-RtRecommendation {
         Sort-Object PriorityRank, ReviewName, Title |
         ForEach-Object {
             $rec = $_
-            $resources = ($rec.Resources | ForEach-Object { $_.ResourceId }) -join '; '
+            $resources = if ($rec.PSObject.Properties['ResourcesLoaded'] -and -not $rec.ResourcesLoaded) { '' } else { ($rec.Resources | ForEach-Object { $_.ResourceId }) -join '; ' }
             # Excel cell limit is 32767 characters.
             if ($resources.Length -gt 32000) { $resources = $resources.Substring(0, 32000) + ' ...' }
             $descParts = @($rec.Description)
@@ -909,7 +1134,7 @@ function Export-RtRecommendation {
                 Description           = ($descParts | Where-Object { $_ }) -join "`n"
                 Labels                = (@('Resiliency', $rec.Priority, $rec.WorkloadName) | Where-Object { $_ }) -join ';'
                 Workload              = $rec.WorkloadName
-                ImpactedResourceCount = $rec.Resources.Count
+                ImpactedResourceCount = if ($rec.PSObject.Properties['ResourceCount']) { $rec.ResourceCount } else { $rec.Resources.Count }
                 ActiveResources       = $rec.StatusCounts.Active
                 PostponedResources    = $rec.StatusCounts.Postponed
                 CompletedResources    = $rec.StatusCounts.Completed
@@ -1181,7 +1406,7 @@ Export-ModuleMember -Function @(
     'Get-RtProp', 'Get-RtDismissReason', 'Get-RtPriorityRank', 'ConvertTo-RtStatusBucket',
     'Initialize-RtLog', 'Write-RtLog', 'Get-RtRecentLog', 'Set-RtProxy', 'Assert-RtAzModule', 'Get-RtAzContextInfo', 'Connect-RtAzure', 'Get-RtArmToken',
     'Invoke-RtArm', 'Get-RtSubscription', 'Invoke-RtGraphQuery',
-    'Get-RtReview', 'Get-RtReviewRecommendation', 'Get-RtGraphReviewRecommendation', 'Merge-RtRecommendationSource', 'Get-RtResourceTypeFromId', 'ConvertTo-RtRecommendation', 'Update-RtRecommendationStatus', 'Merge-RtDuplicateRecommendation',
+    'Get-RtReview', 'Get-RtReviewRecommendation', 'Get-RtGraphReviewRecommendation', 'Merge-RtRecommendationSource', 'Get-RtResourceTypeFromId', 'ConvertTo-RtRecommendation', 'Update-RtRecommendationStatus', 'ConvertFrom-RtSummaryRow', 'Get-RtRecommendationSummary', 'Get-RtRecommendationResource', 'Set-RtRecommendationResource', 'Get-RtReviewFilterKql', 'ConvertTo-RtKqlString', 'Merge-RtDuplicateRecommendation',
     'Get-RtSummary', 'Export-RtRecommendation',
     'Get-RtUpdateOutcome', 'Invoke-RtStatusUpdate', 'Start-RtStatusUpdateJob', 'New-RtDemoData'
 )

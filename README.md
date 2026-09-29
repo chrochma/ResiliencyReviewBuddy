@@ -24,10 +24,10 @@ A PowerShell TUI (text user interface) for the **resiliency reviews** your Micro
 | Step | What happens |
 |------|--------------|
 | **Sign-in** | Finds an existing `Az` context, shows the account and tenant, and asks if you want to reuse it. Otherwise it runs `Connect-AzAccount` (browser or `-UseDeviceAuthentication`). |
-| **Review selection** | Lists every resiliency review you can see (see [Review discovery](#review-discovery)), with the number of affected resources. Pick reviews with checkboxes (`Space` toggles one, `A` toggles all). Very large selections (default > 25,000 resource items) ask before loading. |
+| **Review selection** | Lists every resiliency review you can see (see [Review discovery](#review-discovery)), with the number of affected resources. Pick reviews with checkboxes (`Space` toggles one, `A` toggles all). The resource count is the number of unique resources (older duplicate items are counted once). |
 | **Progress overview** | Stacked progress bar with counts for the selected reviews and for each review. Counts are shown per recommendation and per resource: **Active** (Not started + In progress), **Postponed**, **Completed** and **Dismissed** (formerly *Rejected*). |
 | **Export** | Writes a task-planner CSV of all recommendations, or only the priorities you select. You can export only *Active* work or all statuses. |
-| **Triage** | Lists **all recommendations** of the selected reviews, sorted Critical → High → Medium → Low. Typing searches the **recommendation titles** live. Each row shows the title, number of affected resources, the **review** it comes from, a short description and the current status. A recommendation that appears in several reviews is listed **once**, under the most recent review (by publish date), and shown as `(+n) Review name`. A status change applies to its resources in **all** of those reviews. |
+| **Triage** | Lists **all recommendations** of the selected reviews, sorted Critical → High → Medium → Low. Typing searches the **recommendation titles** live. Each row shows the title, number of affected resources, the **review** it comes from, a short description and the current status. A recommendation that appears in several reviews is listed **once**, under the most recent review (by publish date), and shown as `(+n) Review name`. A status change applies to its resources in **all** of those reviews. The affected resources are loaded only when you pick a status or **Details**. |
 | **Change status** | `Enter` on a recommendation opens the status picker. It shows the current status and switches **all affected resources** to **Completed**, **Postponed** or **Dismissed**. Dismiss asks for a reason; Postpone asks for a date. A details view (description, benefits, notes, resources) is one option away. |
 | **Activity log** | Writes every step and REST call to `exports\logs\session-*.log`. When loading takes more than 15 seconds, the latest activity appears under the spinner. |
 | **Background update** | The update runs as a background thread job, so you can keep triaging. Every resource is **re-read after the update** and the live status decides the result, so an API error on a change that Azure applied anyway still counts as a success. The TUI reports how many resources were **verified** and how many **failed**. Deleted resources are skipped. Details go to `exports\logs\update-*.csv`. |
@@ -64,7 +64,7 @@ cd .\ResiliencyReviewBuddy
 | `-Demo` | Offline demo mode |
 | `-Proxy` | Proxy URL, when the system proxy is not the right one (default: system proxy incl. PAC) |
 | `-ProxyCredential` | Explicit proxy credential when your Windows user is not accepted |
-| `-LargeReviewThreshold` | Resource items above which a review selection asks for confirmation (default 25000) |
+| `-LargeLoadThreshold` | Number of resources above which loading the resource list asks for confirmation (default 10000) |
 
 ### Review discovery
 
@@ -76,7 +76,13 @@ Reviews are collected from three sources, so none is missed:
 
 Subscriptions that could not be read are counted on the selection screen and listed in the activity log.
 
-For large subscriptions (more than 5,000 Advisor items) the live Advisor list API is far too slow (100 items per page), so the status comes from Resource Graph, which can lag a few minutes. Status updates are still verified live per resource.
+### Counts first, resources on demand
+
+Reviews can hold hundreds of thousands of resource items. The tool therefore loads only **counts per recommendation and status**, aggregated server-side in Resource Graph. All reviews of a tenant load in a few seconds, even a review with 200,000+ resources.
+
+The list of affected resources is fetched only for the recommendation you act on: when you pick a status or **Details** in triage, or when you include resource IDs in an export. Above `-LargeLoadThreshold` resources (default 10,000) the tool asks first; Resource Graph returns about 1,000 resources every 4 seconds.
+
+Resource Graph can lag a few minutes behind Advisor, and brand-new Advisor items may not be listed yet. Status updates are always verified live per resource, and the verified statuses are kept for the session, so a reload does not show stale data for recommendations you just changed.
 
 ### Activity log
 
@@ -118,7 +124,8 @@ The export has one row per recommendation, in UTF-8 with BOM so that Excel reads
 | `Labels` | `Resiliency;<Priority>;<Workload>` |
 | `Workload` | Workload name of the review |
 | `ActiveResources` … `DismissedResources` | Number of resources in each status |
-| `ImpactedResources` | Resource IDs separated by `; ` |
+| `ImpactedResourceCount` | Number of unique impacted resources |
+| `ImpactedResources` | Resource IDs separated by `; ` (only if you choose to include them; they are then loaded first) |
 | `Category`, `LearnMoreLink`, `RecommendationTypeId`, `ReviewId` | Reference data |
 
 ## How it works (APIs)
@@ -129,7 +136,8 @@ The tool calls ARM REST directly, using a token from `Get-AzAccessToken`. Only `
 |---------|------|
 | Reviews | `GET /subscriptions/{sub}/providers/Microsoft.Advisor/resiliencyReviews` (tries `2026-03-01-preview` first, then falls back to older versions), plus Resource Graph (see [Review discovery](#review-discovery)) |
 | Titles and texts | Resource Graph `advisorresources` (`label`, `description`, `potentialBenefits`, `notes`). The ARM list API omits these for review items. Also narrows which subscriptions are scanned. |
-| Recommendations | `GET /subscriptions/{sub}/providers/Microsoft.Advisor/recommendations`, keeping only items that link to a review (`properties.review`). Subscriptions with more than 5,000 Advisor items use Resource Graph instead. |
+| Recommendation counts | Resource Graph `advisorresources`, `summarize` per review, recommendation and status (one row per unique resource) |
+| Affected resources | Resource Graph `advisorresources`, filtered by review and recommendation, loaded on demand (see [Counts first](#counts-first-resources-on-demand)) |
 | Set status | `PATCH …/Microsoft.Advisor/recommendations/{name}` with `recommendationStatus` (`Postponed`, `Completed`, `Dismissed`), plus `recommendationDismissReason` or `postponedUntilDateTime` |
 | Verify | `GET {resourceId}/providers/Microsoft.Advisor/recommendations/{name}` after each change |
 

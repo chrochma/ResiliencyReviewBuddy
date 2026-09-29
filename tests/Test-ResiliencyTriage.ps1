@@ -76,6 +76,40 @@ $expectedRes = ($recs | Where-Object Title -eq $vm.Title | ForEach-Object { $_.R
 Assert-That ($vm.Resources.Count -eq $expectedRes) 'resources of all reviews included (status applies to all)'
 Assert-That (@($views | Where-Object { $_.Resources.Count -eq 0 }).Count -eq 0) 'no empty rows'
 
+Write-Host 'Summary first, resources on demand' -ForegroundColor Cyan
+# Resource Graph summary rows (one per recommendation and raw status) built from the demo data.
+$countRows = foreach ($rec in $recs) {
+    foreach ($g in ($rec.Resources | Group-Object Status)) {
+        [pscustomobject]@{ rid = "/subscriptions/x/providers/Microsoft.Advisor/resiliencyReviews/$($rec.ReviewId)"; rname = $rec.ReviewName; typeId = $rec.RecommendationTypeId; label = $rec.Label; groupKey = $rec.Label; st = $g.Name; n = $g.Count }
+    }
+}
+$textRows = foreach ($rec in $recs) {
+    [pscustomobject]@{ rid = "/subscriptions/x/providers/Microsoft.Advisor/resiliencyReviews/$($rec.ReviewId)"; rname = $rec.ReviewName; typeId = $rec.RecommendationTypeId; label = $rec.Label; groupKey = $rec.Label; description = $rec.Description; priority = $rec.Priority; problem = ''; solution = ''; benefits = ''; notes = ''; link = ''; category = $rec.Category }
+}
+$sum = @(ConvertFrom-RtSummaryRow -CountRow @($countRows) -TextRow @($textRows) -Review $demo.Reviews)
+Assert-That ($sum.Count -eq $recs.Count) "summary: one recommendation per group ($($sum.Count))"
+$bad = @($sum | Where-Object { $k = $_.Key; $full = $recs | Where-Object Key -eq $k; -not $full -or $full.ResourceCount -ne $_.ResourceCount -or $full.Status -ne $_.Status -or $full.Priority -ne $_.Priority })
+Assert-That ($bad.Count -eq 0) 'summary keys, counts, status and priority match the resource-level data'
+Assert-That (@($sum | Where-Object ResourcesLoaded).Count -eq 0) 'summary has no resources loaded'
+$sumOverall = (Get-RtSummary -Recommendation $sum -Review $demo.Reviews).Overall
+Assert-That ($sumOverall.ResourceTotal -eq $resourceTotal) 'overview counts work without resources'
+$sumViews = @(Merge-RtDuplicateRecommendation -Recommendation $sum -Review $demo.Reviews)
+$sv = $sumViews | Where-Object Title -eq 'Deploy VMs across Availability Zones'
+Assert-That ($sv.ResourceCount -eq $vm.ResourceCount -and -not $sv.ResourcesLoaded -and $sv.Status -eq $vm.Status) 'merged row sums the counts of all reviews'
+Set-RtRecommendationResource -Target $sum -Loaded @($recs | Where-Object Title -eq $sv.Title) -Requested @($sv.Members)
+$sv2 = @(Merge-RtDuplicateRecommendation -Recommendation @($sv.Members) -Review $demo.Reviews)[0]
+Assert-That ($sv2.ResourcesLoaded -and $sv2.Resources.Count -eq $sv.ResourceCount) 'resources loaded on demand for all copies'
+Assert-That (@($sum | Where-Object ResourcesLoaded).Count -eq $sv.Members.Count) 'only the requested recommendation was loaded'
+$gone = $sum | Where-Object { -not $_.ResourcesLoaded } | Select-Object -First 1
+Set-RtRecommendationResource -Target $sum -Loaded @() -Requested @($gone)
+Assert-That ($gone.ResourcesLoaded -and $gone.ResourceCount -eq 0) 'requested but nothing found -> loaded, 0 resources'
+$csv2 = Join-Path ([IO.Path]::GetTempPath()) ("rt-test-{0}.csv" -f [guid]::NewGuid().ToString('N'))
+try {
+    $null = Export-RtRecommendation -Recommendation @($sum | Where-Object { -not $_.ResourcesLoaded } | Select-Object -First 3) -Path $csv2
+    $row = @(Import-Csv $csv2)[0]
+    Assert-That ([int]$row.ImpactedResourceCount -gt 0 -and -not $row.ImpactedResources) 'export of summary rows: counts without resource IDs'
+}
+finally { Remove-Item $csv2 -ErrorAction SilentlyContinue }
 Write-Host 'Export' -ForegroundColor Cyan
 $csv = Join-Path ([IO.Path]::GetTempPath()) ("rt-test-{0}.csv" -f [guid]::NewGuid().ToString('N'))
 try {
