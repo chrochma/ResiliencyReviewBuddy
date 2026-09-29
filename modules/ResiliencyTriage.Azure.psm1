@@ -445,12 +445,30 @@ function ConvertTo-RtRecommendation {
         $resourceId = [string](Get-RtProp $p 'resourceMetadata.resourceId')
         if (-not $resourceId -and $armId -match '(?i)^(.+)/providers/Microsoft\.Advisor/recommendations/') { $resourceId = $Matches[1] }
         $subId = if ($armId -match '(?i)^/subscriptions/([^/]+)') { $Matches[1] } else { $review.SubscriptionId }
-        $rawStatus = [string](Get-RtProp $p 'recommendationStatus' 'New')
+        # Current model has recommendationStatus; legacy triage copies only trackedProperties.state.
+        $isCurrent = [bool](Get-RtProp $p 'recommendationStatus')
+        $rawStatus = [string](Get-RtProp $p 'recommendationStatus')
+        if (-not $rawStatus) { $rawStatus = [string](Get-RtProp $p 'customerState') }
+        if (-not $rawStatus) { $rawStatus = [string](Get-RtProp $p 'trackedProperties.state' 'New') }
         # impactedField/impactedValue are unreliable for review items, the resource ID is not.
         $resType = Get-RtResourceTypeFromId $resourceId
         if (-not $resType) { $resType = [string](Get-RtProp $p 'impactedField') }
         $resName = if ($resourceId) { $resourceId.TrimEnd('/').Split('/')[-1] } else { [string](Get-RtProp $p 'impactedValue') }
+
+        # Advisor can hold a legacy and a current object for the same resource; the portal counts it once.
+        $resKey = if ($resourceId) { $resourceId.TrimEnd('/').ToLowerInvariant() } else { $armId.ToLowerInvariant() }
+        $updated = [datetime]::MinValue
+        $null = [datetime]::TryParse([string](Get-RtProp $p 'lastUpdated'), [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$updated)
+        $existing = $groups[$key].Resources | Where-Object { $_.ResourceKey -eq $resKey } | Select-Object -First 1
+        if ($existing) {
+            $better = ($isCurrent -and -not $existing.IsCurrent) -or ($isCurrent -eq $existing.IsCurrent -and $updated -gt $existing.LastUpdated)
+            if (-not $better) { continue }
+            $null = $groups[$key].Resources.Remove($existing)
+        }
         $groups[$key].Resources.Add([pscustomobject]@{
+            ResourceKey         = $resKey
+            IsCurrent           = $isCurrent
+            LastUpdated         = $updated
             RecommendationArmId = $armId
             RecommendationName  = [string](Get-RtProp $raw 'name')
             RecommendationTypeId = $typeId

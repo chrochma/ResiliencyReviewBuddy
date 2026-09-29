@@ -94,6 +94,8 @@ The tool calls ARM REST directly, using a token from `Get-AzAccessToken`. Only `
 > **Linked recommendations:** review recommendations on the same resource often share one `recommendationTypeId`. Azure may apply a status change to all of them, including those in other reviews. The tool updates them one at a time, warns you before the change, and re-reads and reports the related items afterwards.
 
 > Microsoft retired the old triage flow (Pending / Accepted / Rejected). The statuses are now **Active**, **Postponed**, **Completed** and **Dismissed**. See [Azure Advisor resiliency reviews](https://learn.microsoft.com/azure/advisor/advisor-resiliency-reviews).
+>
+> Older reviews can still hold a legacy copy (GUID name, only `trackedProperties.state`) next to the current object for the same resource. Like the portal, the tool counts each resource once and uses the current object; legacy-only items take their status from `trackedProperties.state`.
 
 ## Structure
 

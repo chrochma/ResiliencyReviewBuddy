@@ -139,6 +139,19 @@ Assert-That (@(ConvertTo-RtRecommendation -RawRecommendation $noLabel -Review $d
 Assert-That ((Get-RtResourceTypeFromId '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Storage/storageAccounts/st1') -eq 'Microsoft.Storage/storageAccounts') 'resource type from ID'
 Assert-That ((Get-RtResourceTypeFromId '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Sql/servers/sq/databases/db') -eq 'Microsoft.Sql/servers/databases') 'nested resource type from ID'
 
+Write-Host 'Legacy duplicate objects' -ForegroundColor Cyan
+$rev = [pscustomobject]@{ id = $demo.Reviews[0].ReviewId }
+$vnet = '/subscriptions/s/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/vn1'
+$current = [pscustomobject]@{ id = "$vnet/providers/Microsoft.Advisor/recommendations/hash1"; name = 'hash1'
+    properties = [pscustomobject]@{ label = 'Flow logs'; recommendationTypeId = 't'; recommendationStatus = 'Completed'; review = $rev; resourceMetadata = [pscustomobject]@{ resourceId = $vnet } } }
+$legacy = [pscustomobject]@{ id = "$vnet/providers/Microsoft.Advisor/recommendations/0000-guid"; name = '0000-guid'
+    properties = [pscustomobject]@{ label = 'Flow logs'; recommendationTypeId = 't'; review = $rev; resourceMetadata = $null; trackedProperties = [pscustomobject]@{ state = 'Completed' } } }
+$l = @(ConvertTo-RtRecommendation -RawRecommendation @($legacy, $current) -Review $demo.Reviews)
+Assert-That ($l.Count -eq 1 -and $l[0].Resources.Count -eq 1) 'legacy + current object on one resource counted once'
+Assert-That ($l[0].Resources[0].RecommendationName -eq 'hash1' -and $l[0].Status -eq 'Completed') 'current object preferred'
+$lo = @(ConvertTo-RtRecommendation -RawRecommendation @($legacy) -Review $demo.Reviews)
+Assert-That ($lo[0].Status -eq 'Completed') 'legacy-only status from trackedProperties.state'
+
 Write-Host 'TUI helpers' -ForegroundColor Cyan
 $ansi = "$([char]27)[91mHello$([char]27)[0m World"
 Assert-That ((Get-RtVisibleLength (Limit-RtLine $ansi 7)) -eq 7) 'Limit-RtLine keeps visible width'
