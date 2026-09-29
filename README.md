@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="assets/resiliency-triage-banner.svg" alt="Resiliency Review Triage" width="100%">
+  <img src="assets/resiliency-triage-banner.svg" alt="Resiliency Review Buddy" width="100%">
 </p>
 
-# Resiliency Review Triage
+# Resiliency Review Buddy
 
 A PowerShell TUI (text user interface) for the **resiliency reviews** your Microsoft account team shares with you in [Azure Advisor](https://learn.microsoft.com/azure/advisor/advisor-resiliency-reviews). With it you can:
 
@@ -32,7 +32,8 @@ A PowerShell TUI (text user interface) for the **resiliency reviews** your Micro
 ## Usage
 
 ```powershell
-cd .\AIApps\ResiliencyTriage
+git clone https://github.com/chrochma/ResiliencyReviewBuddy.git
+cd .\ResiliencyReviewBuddy
 
 # Interactive: reuse or create an Azure sign-in, then pick reviews
 .\Start-ResiliencyTriage.ps1
@@ -100,7 +101,7 @@ The tool calls ARM REST directly, using a token from `Get-AzAccessToken`. Only `
 ## Structure
 
 ```text
-ResiliencyTriage/
+ResiliencyReviewBuddy/
 ├─ Start-ResiliencyTriage.ps1         # entry point / flow
 ├─ modules/
 │  ├─ ResiliencyTriage.Azure.psm1     # auth, REST, grouping, export, background update, demo data
