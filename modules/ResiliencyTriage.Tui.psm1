@@ -586,6 +586,8 @@ function Show-RtRecommendationDetail {
         $body.Add(("Priority: {0}{1}{2}   Status: {3}{4}{2}   Resources: {5}   Category: {6}" -f `
             (Get-RtPriorityCell $r.Priority), $r.Priority, $script:C.Reset, (Get-RtStatusColor $r.Status), $statusText, $r.Resources.Count, $r.Category))
         $body.Add("$($script:C.Muted)Review: $($r.ReviewName)   Workload: $($r.WorkloadName)$($script:C.Reset)")
+        $others = if ($r.PSObject.Properties['OtherReviews']) { @($r.OtherReviews) } else { @() }
+        if ($others.Count) { $body.Add("$($script:C.Muted)Also in: $($others -join ', ') (status changes apply to all)$($script:C.Reset)") }
         $body.Add("Resource status: $(Format-RtCounts $r.StatusCounts)")
         $body.Add('')
         $section = {
@@ -607,6 +609,7 @@ function Show-RtRecommendationDetail {
             @{ Header = 'Type'; Flex = 3; Value = { param($x) $x.ResourceType } }
             @{ Header = 'Resource group'; Flex = 2; Value = { param($x) $x.ResourceGroup } }
             @{ Header = 'Subscription'; Width = 36; Value = { param($x) $x.SubscriptionId } }
+            @{ Header = 'Review'; Flex = 2; Value = { param($x) if ($x.PSObject.Properties['ReviewName']) { $x.ReviewName } else { '' } } }
         )
         $body.Add("$($script:C.Muted)  $(Format-RtHeaderRow $cols)$($script:C.Reset)")
         $visible = [Math]::Max($size.Height - 4 - $body.Count - 2, 2)

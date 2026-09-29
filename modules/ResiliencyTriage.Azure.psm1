@@ -454,6 +454,7 @@ function ConvertTo-RtRecommendation {
             RecommendationArmId = $armId
             RecommendationName  = [string](Get-RtProp $raw 'name')
             RecommendationTypeId = $typeId
+            ReviewName          = $review.ReviewName
             SubscriptionId      = $subId
             ResourceId          = $resourceId
             ResourceName        = $resName
@@ -510,6 +511,59 @@ function Get-RtReviewRecommendation {
     $arm = @(Get-RtRawReviewRecommendation -Token $Token -SubscriptionId @($targets))
     $raw = @(Merge-RtRecommendationSource -Arm $arm -Graph $graph)
     return ConvertTo-RtRecommendation -RawRecommendation $raw -Review $Review
+}
+
+function Merge-RtDuplicateRecommendation {
+    <#
+    .SYNOPSIS
+        Triage view: one row per recommendation title, even if several reviews contain it.
+    .DESCRIPTION
+        The row shows the copy from the most recent review (PublishedAt). Its Resources
+        contain the resources of every copy, so a status change updates all reviews.
+        The underlying per-review recommendations stay untouched for overview and export.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Recommendation, [Parameter(Mandatory)][object[]]$Review)
+    $published = @{}
+    foreach ($rv in $Review) {
+        $d = [datetime]::MinValue
+        foreach ($v in $rv.PublishedAt, $rv.UpdatedAt) { if ($v -and [datetime]::TryParse([string]$v, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { break } }
+        $published[$rv.ReviewId] = $d
+    }
+    $groups = [ordered]@{}
+    foreach ($rec in $Recommendation) {
+        $k = if ($rec.Title -and $rec.Title -ne '(untitled recommendation)') { 'title:' + ($rec.Title -replace '\s+', ' ').Trim().ToLowerInvariant() } else { 'key:' + $rec.Key }
+        if (-not $groups.Contains($k)) { $groups[$k] = [System.Collections.Generic.List[object]]::new() }
+        $groups[$k].Add($rec)
+    }
+    $views = foreach ($k in $groups.Keys) {
+        $members = @($groups[$k] | Sort-Object @{ Expression = { $published[$_.ReviewId] }; Descending = $true }, ReviewName)
+        $p = $members[0]
+        $view = [pscustomobject]@{
+            Key                  = $k
+            ReviewId             = $p.ReviewId
+            ReviewName           = $p.ReviewName
+            WorkloadName         = $p.WorkloadName
+            OtherReviews         = @($members | Select-Object -Skip 1 | ForEach-Object ReviewName | Where-Object { $_ -ne $p.ReviewName } | Select-Object -Unique)
+            Members              = $members
+            Title                = $p.Title
+            Description          = $p.Description
+            PotentialBenefits    = $p.PotentialBenefits
+            Notes                = $p.Notes
+            LearnMoreLink        = $p.LearnMoreLink
+            Category             = $p.Category
+            RecommendationTypeId = $p.RecommendationTypeId
+            Priority             = $p.Priority
+            PriorityRank         = $p.PriorityRank
+            Resources            = [System.Collections.Generic.List[object]]::new()
+            Status               = 'Active'
+            IsMixed              = $false
+            StatusCounts         = $null
+        }
+        foreach ($m in $members) { foreach ($r in $m.Resources) { $view.Resources.Add($r) } }
+        Update-RtRecommendationStatus -Recommendation $view
+        $view
+    }
+    return @($views | Sort-Object PriorityRank, Title)
 }
 
 function Get-RtSummary {
@@ -847,7 +901,7 @@ Export-ModuleMember -Function @(
     'Get-RtProp', 'Get-RtDismissReason', 'Get-RtPriorityRank', 'ConvertTo-RtStatusBucket',
     'Assert-RtAzModule', 'Get-RtAzContextInfo', 'Connect-RtAzure', 'Get-RtArmToken',
     'Invoke-RtArm', 'Get-RtSubscription', 'Invoke-RtGraphQuery',
-    'Get-RtReview', 'Get-RtReviewRecommendation', 'Get-RtGraphReviewRecommendation', 'Merge-RtRecommendationSource', 'Get-RtResourceTypeFromId', 'ConvertTo-RtRecommendation', 'Update-RtRecommendationStatus',
+    'Get-RtReview', 'Get-RtReviewRecommendation', 'Get-RtGraphReviewRecommendation', 'Merge-RtRecommendationSource', 'Get-RtResourceTypeFromId', 'ConvertTo-RtRecommendation', 'Update-RtRecommendationStatus', 'Merge-RtDuplicateRecommendation',
     'Get-RtSummary', 'Export-RtRecommendation',
     'Get-RtUpdateOutcome', 'Invoke-RtStatusUpdate', 'Start-RtStatusUpdateJob', 'New-RtDemoData'
 )

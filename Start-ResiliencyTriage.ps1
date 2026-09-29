@@ -347,7 +347,7 @@ function Invoke-Export {
 function Invoke-SetStatus {
     <# Collects the status parameters, confirms and starts the background update. #>
     param([object]$Recommendation, [string]$Status)
-    $running = @($state.Jobs | Where-Object { $_.Recommendation -eq $Recommendation })
+    $running = @($state.Jobs | Where-Object { $_.Recommendation.Key -eq $Recommendation.Key })
     if ($running) {
         Show-RtMessage -Title 'Update running' -Lines @("$($Clr.Warn)An update for this recommendation is still running. Wait until it has finished.$($Clr.Reset)")
         return
@@ -387,7 +387,7 @@ function Invoke-SetStatus {
 
     $lines = @(
         "$($Clr.Bold)$($Recommendation.Title)$($Clr.Reset)"
-        "$($Clr.Muted)$($Recommendation.ReviewName)$($Clr.Reset)"
+        "$($Clr.Muted)Review: $(@($Recommendation.ReviewName) + @($Recommendation.PSObject.Properties['OtherReviews'] ? $Recommendation.OtherReviews : @()) -join ', ')$($Clr.Reset)"
         ''
         "New status : $($Clr.Bold)$Status$($Clr.Reset)"
     )
@@ -397,9 +397,13 @@ function Invoke-SetStatus {
     # Other loaded recommendations on the same resources with the same type: Azure may change them too.
     $keys = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($r in $targets) { $null = $keys.Add(('{0}|{1}' -f $r.ResourceId, $r.RecommendationTypeId)) }
+    $own = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($r in $Recommendation.Resources) { $null = $own.Add([string]$r.RecommendationArmId) }
     $siblings = @(foreach ($rec in $state.Recommendations) {
-        if ($rec -eq $Recommendation) { continue }
-        foreach ($r in $rec.Resources) { if ($r.RecommendationTypeId -and $keys.Contains(('{0}|{1}' -f $r.ResourceId, $r.RecommendationTypeId))) { $r } }
+        foreach ($r in $rec.Resources) {
+            if ($own.Contains([string]$r.RecommendationArmId)) { continue }
+            if ($r.RecommendationTypeId -and $keys.Contains(('{0}|{1}' -f $r.ResourceId, $r.RecommendationTypeId))) { $r }
+        }
     })
     if ($siblings) {
         $lines += "$($Clr.Warn)Note: $($siblings.Count) other recommendation(s) on the same resource(s) share this recommendation type.$($Clr.Reset)"
@@ -431,6 +435,7 @@ function Select-StatusAction {
             (Get-RtStatusColor $r.Status), $(if ($r.IsMixed) { "$($r.Status) (mixed)" } else { $r.Status }), $r.Resources.Count)
         "Resource status: $(Format-RtCounts $r.StatusCounts)"
         "$($Clr.Muted)Review: $($r.ReviewName)$($Clr.Reset)"
+        if ($r.OtherReviews.Count) { "$($Clr.Muted)Also in: $($r.OtherReviews -join ', ') (updated together)$($Clr.Reset)" }
         ''
         'Change the status of all resources of this recommendation to:'
     }
@@ -446,23 +451,24 @@ function Select-StatusAction {
 }
 
 function Invoke-Triage {
-    $multiReview = $state.SelectedReviews.Count -gt 1
     while ($true) {
+        # One row per recommendation (duplicates across reviews merged into the most recent review).
         # Critical first, then High, Medium, Low; open work before closed work.
         $statusRank = @{ Active = 0; Postponed = 1; Dismissed = 2; Completed = 3 }
-        $items = @($state.Recommendations | Sort-Object PriorityRank, @{ Expression = { $statusRank[$_.Status] } }, @{ Expression = { $_.Resources.Count }; Descending = $true }, Title)
+        $views = @(Merge-RtDuplicateRecommendation -Recommendation @($state.Recommendations) -Review @($state.SelectedReviews))
+        $items = @($views | Sort-Object PriorityRank, @{ Expression = { $statusRank[$_.Status] } }, @{ Expression = { $_.Resources.Count }; Descending = $true }, Title)
         if (-not $items) { Show-RtMessage -Title 'Triage' -Lines @('The selected reviews have no recommendations.'); return }
         $cols = @(
             @{ Header = 'Priority'; Width = 13; Value = { param($r) "● $($r.Priority)" }; Color = { param($r) Get-RtPriorityCell $r.Priority } }
             @{ Header = 'Status'; Width = 11; Value = { param($r) if ($r.IsMixed) { "$($r.Status)*" } else { $r.Status } }; Color = { param($r) Get-RtStatusColor $r.Status } }
             @{ Header = 'Res.'; Width = 5; Value = { param($r) $r.Resources.Count.ToString().PadLeft(4) } }
             @{ Header = 'Recommendation'; Flex = 5; Value = { param($r) $r.Title } }
-            @{ Header = 'Description'; Flex = 3; Value = { param($r) $r.Description }; Color = { param($r) Get-RtColor 'Muted' } }
+            @{ Header = 'Review'; Flex = 3; Value = { param($r) if ($r.OtherReviews.Count) { "(+$($r.OtherReviews.Count)) $($r.ReviewName)" } else { $r.ReviewName } } }
+            @{ Header = 'Description'; Flex = 2; Value = { param($r) $r.Description }; Color = { param($r) Get-RtColor 'Muted' } }
         )
-        if ($multiReview) { $cols += @{ Header = 'Review'; Flex = 2; Value = { param($r) $r.ReviewName }; Color = { param($r) Get-RtColor 'Muted' } } }
 
         $pick = Show-RtFilterList -Title "Recommendations ($($items.Count)) - type to search titles" -Item $items -Column $cols -Filter $state.Filter -Index $state.ListIndex `
-            -Banner { & $banner; "$(Get-RtColor 'Muted')Enter = change status of all resources   * = resources have different states$(Get-RtColor 'Reset')" } -OnTick $onTick `
+            -Banner { & $banner; "$(Get-RtColor 'Muted')Enter = change status of all resources   * = resources have different states   (+n) = also in n more review(s), updated together$(Get-RtColor 'Reset')" } -OnTick $onTick `
             -SearchText { param($r) $r.Title }
         if ($null -eq $pick) { $state.Filter = ''; $state.ListIndex = 0; return }
         $state.Filter = $pick.Filter

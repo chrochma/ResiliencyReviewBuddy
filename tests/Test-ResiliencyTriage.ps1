@@ -65,6 +65,17 @@ foreach ($r in $rec.Resources) { $r.Status = 'Completed' }
 Update-RtRecommendationStatus -Recommendation $rec
 Assert-That ((-not $rec.IsMixed) -and $rec.Status -eq 'Completed') 'all Completed -> Completed'
 
+Write-Host 'Duplicates across reviews' -ForegroundColor Cyan
+$views = @(Merge-RtDuplicateRecommendation -Recommendation $recs -Review $demo.Reviews)
+$titles = @($recs.Title | Sort-Object -Unique)
+Assert-That ($views.Count -eq $titles.Count) "one row per title ($($views.Count))"
+$vm = $views | Where-Object Title -eq 'Deploy VMs across Availability Zones'
+Assert-That ($vm.ReviewName -eq 'WARA - Contoso Web Shop') 'shown for the most recent review'
+Assert-That ($vm.OtherReviews.Count -eq 2) 'other reviews listed'
+$expectedRes = ($recs | Where-Object Title -eq $vm.Title | ForEach-Object { $_.Resources.Count } | Measure-Object -Sum).Sum
+Assert-That ($vm.Resources.Count -eq $expectedRes) 'resources of all reviews included (status applies to all)'
+Assert-That (@($views | Where-Object { $_.Resources.Count -eq 0 }).Count -eq 0) 'no empty rows'
+
 Write-Host 'Export' -ForegroundColor Cyan
 $csv = Join-Path ([IO.Path]::GetTempPath()) ("rt-test-{0}.csv" -f [guid]::NewGuid().ToString('N'))
 try {
