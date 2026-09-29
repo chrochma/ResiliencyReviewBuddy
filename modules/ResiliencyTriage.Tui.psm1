@@ -489,10 +489,24 @@ function Invoke-RtBusy {
     $frames = @('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $f = 0
+    $logType = 'ResiliencyTriage.RtLog' -as [type]
     try {
         while ($job.State -in 'NotStarted', 'Running') {
-            $body = @('', "  $($script:C.Accent)$($frames[$f % $frames.Count])$($script:C.Reset)  $Message  $($script:C.Muted)($([int]$sw.Elapsed.TotalSeconds)s)$($script:C.Reset)")
-            Write-RtFrame (New-RtScreen -Top (Get-RtTitleLines $Title) -Body $body -Footer 'Working… please wait')
+            $body = [System.Collections.Generic.List[string]]::new()
+            $body.Add(''); $body.Add("  $($script:C.Accent)$($frames[$f % $frames.Count])$($script:C.Reset)  $Message  $($script:C.Muted)($([int]$sw.Elapsed.TotalSeconds)s)$($script:C.Reset)")
+            # Slow? Show what is going on (activity log of the job and its parallel runspaces).
+            if ($sw.Elapsed.TotalSeconds -ge 15 -and $logType) {
+                $size = Get-RtSize
+                $room = [Math]::Max($size.Height - 12, 3)
+                $body.Add('')
+                $body.Add("  $($script:C.Warn)Taking longer than usual - latest activity:$($script:C.Reset)")
+                foreach ($l in $logType::Recent($room)) {
+                    $text = if ($l.Length -gt 11) { $l.Substring(11) } else { $l }
+                    $body.Add("  $($script:C.Muted)$(Limit-RtLine $text ($size.Width - 4))$($script:C.Reset)")
+                }
+                if ($logType::Path) { $body.Add(''); $body.Add("  $($script:C.Muted)$(Limit-RtLine "Full log: $($logType::Path)" ($size.Width - 4))$($script:C.Reset)") }
+            }
+            Write-RtFrame (New-RtScreen -Top (Get-RtTitleLines $Title) -Body $body.ToArray() -Footer 'Working… please wait')
             $f++
             Start-Sleep -Milliseconds 120
         }

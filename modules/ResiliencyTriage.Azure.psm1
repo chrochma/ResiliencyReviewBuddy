@@ -22,6 +22,37 @@ $script:SubscriptionApi     = '2022-12-01'
 
 $script:PriorityRank = @{ Critical = 0; High = 1; Medium = 2; Low = 3; Informational = 4 }
 
+# Process-wide activity log. A static .NET type is shared by the TUI, thread jobs and
+# ForEach-Object -Parallel runspaces without copying functions around.
+if (-not ('ResiliencyTriage.RtLog' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+namespace ResiliencyTriage {
+    public static class RtLog {
+        static readonly object Gate = new object();
+        static readonly LinkedList<string> Buffer = new LinkedList<string>();
+        public static string Path;
+        public static void Write(string level, string message) {
+            string line = string.Format("{0:yyyy-MM-dd HH:mm:ss.fff} [{1,3}] {2,-5} {3}", DateTime.Now, Environment.CurrentManagedThreadId, level, message);
+            lock (Gate) {
+                Buffer.AddLast(line);
+                while (Buffer.Count > 500) Buffer.RemoveFirst();
+                if (!string.IsNullOrEmpty(Path)) { try { System.IO.File.AppendAllText(Path, line + Environment.NewLine); } catch { } }
+            }
+        }
+        public static string[] Recent(int count) {
+            lock (Gate) {
+                var all = new List<string>(Buffer);
+                int start = Math.Max(0, all.Count - count);
+                return all.GetRange(start, all.Count - start).ToArray();
+            }
+        }
+    }
+}
+'@
+}
+
 $script:DismissReasons = @(
     'RiskIsAcceptable'
     'AnAlternativeSolutionIsAlreadyInPlace'
@@ -33,6 +64,28 @@ $script:DismissReasons = @(
 )
 
 #region Helpers
+
+function Initialize-RtLog {
+    <# Starts the session log file; returns its path. #>
+    param([Parameter(Mandatory)][string]$Folder)
+    $null = New-Item -ItemType Directory -Path $Folder -Force
+    $path = Join-Path $Folder ('session-{0}.log' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    [ResiliencyTriage.RtLog]::Path = $path
+    Write-RtLog "Session started - PowerShell $($PSVersionTable.PSVersion) on $([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)"
+    return $path
+}
+
+function Write-RtLog {
+    <# Adds a line to the activity log (file + in-memory buffer shown by the TUI). #>
+    param([Parameter(Mandatory)][string]$Message, [ValidateSet('INFO', 'WARN', 'ERROR', 'HTTP')][string]$Level = 'INFO')
+    [ResiliencyTriage.RtLog]::Write($Level, $Message)
+}
+
+function Get-RtRecentLog {
+    <# Latest activity log lines. #>
+    param([int]$Count = 10)
+    @([ResiliencyTriage.RtLog]::Recent($Count))
+}
 
 function Get-RtProp {
     <# StrictMode-safe property read (supports dotted paths) for ConvertFrom-Json objects. #>
@@ -147,6 +200,7 @@ function Connect-RtAzure {
     $params = @{ ErrorAction = 'Stop'; WarningAction = 'SilentlyContinue' }
     if ($TenantId) { $params['TenantId'] = $TenantId }
     if ($UseDeviceAuthentication) { $params['UseDeviceAuthentication'] = $true }
+    Write-RtLog "Connect-AzAccount (tenant '$TenantId', device code: $([bool]$UseDeviceAuthentication))"
     $null = Connect-AzAccount @params
     return Get-RtAzContextInfo
 }
@@ -155,7 +209,9 @@ function Get-RtArmToken {
     <# Returns a plain-text ARM bearer token for the current context (handles SecureString tokens). #>
     $params = @{ ResourceUrl = 'https://management.azure.com/'; ErrorAction = 'Stop'; WarningAction = 'SilentlyContinue' }
     if ((Get-Command Get-AzAccessToken).Parameters.ContainsKey('AsSecureString')) { $params['AsSecureString'] = $true }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $token = (Get-AzAccessToken @params).Token
+    Write-RtLog ("ARM token acquired in {0:n1}s" -f $sw.Elapsed.TotalSeconds)
     if ($token -is [securestring]) { $token = ConvertFrom-SecureString -SecureString $token -AsPlainText }
     return [string]$token
 }
@@ -189,22 +245,33 @@ function Invoke-RtArm {
     $payload = if ($null -ne $Body) { $Body | ConvertTo-Json -Depth 20 -Compress } else { $null }
 
     $items = [System.Collections.Generic.List[object]]::new()
+    $page = 0
     while ($uri) {
         $attempt = 0
+        $page++
+        # Log without host/query noise (never the token or body).
+        $short = ($uri -replace '^https://management\.azure\.com', '' -replace '\?.*$', '')
+        if ($short.Length -gt 140) { $short = $short.Substring(0, 60) + '…' + $short.Substring($short.Length - 79) }
+        if ($page -gt 1) { $short += " (page $page)" }
         while ($true) {
             $attempt++
+            [ResiliencyTriage.RtLog]::Write('HTTP', "-> $Method $short")
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
             $req = @{ Uri = $uri; Method = $Method; Headers = $headers; SkipHttpErrorCheck = $true; ErrorAction = 'Stop'; TimeoutSec = 100 }
             if ($payload) { $req['Body'] = $payload; $req['ContentType'] = 'application/json' }
             try { $resp = Invoke-WebRequest @req }
             catch {
+                [ResiliencyTriage.RtLog]::Write('ERROR', ("<- {0} {1} failed after {2:n1}s: {3}" -f $Method, $short, $sw.Elapsed.TotalSeconds, $_.Exception.Message))
                 if ("$_" -match '407') { throw "Proxy authentication failed (HTTP 407). Your Windows user was rejected by the proxy - run again with -ProxyCredential (Get-Credential) or -Proxy <url>. Details: $_" }
                 throw
             }
             $code = [int]$resp.StatusCode
+            [ResiliencyTriage.RtLog]::Write('HTTP', ("<- {0} {1} {2} in {3:n1}s" -f $code, $Method, $short, $sw.Elapsed.TotalSeconds))
             if (($code -eq 429 -or $code -ge 500) -and $attempt -le 4) {
                 $wait = 2 * $attempt
                 $retryAfter = $resp.Headers['Retry-After']
                 if ($retryAfter) { $null = [int]::TryParse([string]@($retryAfter)[0], [ref]$wait) }
+                [ResiliencyTriage.RtLog]::Write('WARN', "HTTP $code - retry $attempt in ${wait}s")
                 Start-Sleep -Seconds ([Math]::Min([Math]::Max($wait, 1), 30))
                 continue
             }
@@ -236,6 +303,7 @@ function Get-RtSubscription {
     <# Enabled subscriptions visible to the token's tenant. #>
     param([Parameter(Mandatory)][string]$Token)
     $subs = Invoke-RtArm -Token $Token -Path '/subscriptions' -ApiVersion $script:SubscriptionApi -AllPages
+    Write-RtLog "Subscriptions visible: $(@($subs).Count)"
     @($subs | Where-Object { (Get-RtProp $_ 'state') -eq 'Enabled' } | ForEach-Object {
         [pscustomobject]@{ SubscriptionId = [string]$_.subscriptionId; Name = [string]$_.displayName; TenantId = [string](Get-RtProp $_ 'tenantId') }
     })
@@ -255,6 +323,7 @@ function Invoke-RtGraphQuery {
             $res = Invoke-RtArm -Token $Token -Method POST -Path '/providers/Microsoft.ResourceGraph/resources' `
                 -ApiVersion $script:GraphApiVersion -Body @{ subscriptions = $chunk; query = $Query; options = $options }
             foreach ($r in @(Get-RtProp $res 'data' @())) { $rows.Add($r) }
+            Write-RtLog "Resource Graph: $($rows.Count) row(s) so far (subscriptions $($i + 1)-$($i + $chunk.Count) of $($SubscriptionId.Count))"
             $skip = [string](Get-RtProp $res '$skipToken')
         } while ($skip)
     }
@@ -280,6 +349,7 @@ function Get-RtReview {
     $armFn = ${function:Invoke-RtArm}.ToString()
     $propFn = ${function:Get-RtProp}.ToString()
     $apiVersions = $script:ReviewApiVersions
+    Write-RtLog "Scanning $(@($Subscription).Count) subscription(s) for resiliency reviews (parallel $ThrottleLimit)"
 
     $results = $Subscription | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
         Set-StrictMode -Version Latest
@@ -323,6 +393,8 @@ function Get-RtReview {
     $reviews = @($results | Where-Object Kind -eq 'Review' | Select-Object * -ExcludeProperty Kind |
         Sort-Object -Property @{ Expression = 'PublishedAt'; Descending = $true }, ReviewName)
     $errors = @($results | Where-Object Kind -eq 'Error')
+    Write-RtLog "Found $($reviews.Count) review(s); $($errors.Count) subscription(s) not readable"
+    foreach ($e in $errors | Select-Object -First 20) { Write-RtLog "  $($e.SubscriptionId): $($e.Message)" -Level WARN }
     [pscustomobject]@{ Reviews = $reviews; FailedSubscriptions = $errors }
 }
 
@@ -338,12 +410,23 @@ function Get-RtGraphReviewRecommendation {
         The ARM list API omits title (label), description, benefits and notes of review
         recommendations; Resource Graph has them. Used to enrich the live ARM data.
     #>
-    param([Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string[]]$SubscriptionId)
+    param([Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string[]]$SubscriptionId, [object[]]$Review = @())
+    # Only rows of the selected reviews (by review ID or name) - big tenants hold many reviews.
+    $reviewFilter = ''
+    if ($Review) {
+        $q = { param($v) "'" + ([string]$v).Replace('\', '\\').Replace("'", "\'") + "'" }
+        $ids = @($Review | Where-Object ReviewId | ForEach-Object { & $q $_.ReviewId.ToLowerInvariant() }) -join ', '
+        $names = @($Review | Where-Object ReviewName | ForEach-Object { & $q $_.ReviewName }) -join ', '
+        $conds = @()
+        if ($ids) { $conds += "rid in~ ($ids)"; $conds += "tostring(split(rid, '/')[-1]) in~ ($ids)" }
+        if ($names) { $conds += "rname in~ ($names)" }
+        if ($conds) { $reviewFilter = "| extend rid = tostring(properties.review.id), rname = tostring(properties.review.name)`n| where $($conds -join ' or ')`n" }
+    }
     $query = @"
 advisorresources
 | where type =~ 'microsoft.advisor/recommendations'
 | where isnotempty(properties.review)
-| project id, name, subscriptionId, properties
+$reviewFilter| project id, name, subscriptionId, properties
 "@
     @(Invoke-RtGraphQuery -Token $Token -Query $query -SubscriptionId $SubscriptionId)
 }
@@ -401,13 +484,14 @@ function Get-RtRawReviewRecommendation {
         Set-StrictMode -Version Latest
         ${function:Invoke-RtArm} = [scriptblock]::Create($using:armFn)
         ${function:Get-RtProp} = [scriptblock]::Create($using:propFn)
+        $sub = $_
         try {
-            $items = Invoke-RtArm -Token $using:Token -Path "/subscriptions/$_/providers/Microsoft.Advisor/recommendations" -ApiVersion $using:api -AllPages
+            $items = Invoke-RtArm -Token $using:Token -Path "/subscriptions/$sub/providers/Microsoft.Advisor/recommendations" -ApiVersion $using:api -AllPages
         }
-        catch { return }
-        foreach ($i in @($items)) {
-            if (Get-RtProp $i 'properties.review' $null) { $i }
-        }
+        catch { [ResiliencyTriage.RtLog]::Write('WARN', "Advisor recommendations of $sub not readable: $($_.Exception.Message)"); return }
+        $linked = @($items | Where-Object { Get-RtProp $_ 'properties.review' $null })
+        [ResiliencyTriage.RtLog]::Write('INFO', "Subscription $($sub): $(@($items).Count) Advisor recommendation(s), $($linked.Count) linked to reviews")
+        $linked
     }
 }
 
@@ -553,18 +637,28 @@ function Get-RtReviewRecommendation {
     )
     $targets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($r in $Review) { $null = $targets.Add($r.SubscriptionId) }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    Write-RtLog "Loading recommendations of $(@($Review).Count) review(s): $((@($Review.ReviewName) -join ', '))"
     $graph = @()
     try {
-        $graph = @(Get-RtGraphReviewRecommendation -Token $Token -SubscriptionId $ScanSubscription)
+        Write-RtLog "Step 1/3: Resource Graph query over $(@($ScanSubscription).Count) subscription(s)"
+        $graph = @(Get-RtGraphReviewRecommendation -Token $Token -SubscriptionId $ScanSubscription -Review $Review)
         foreach ($g in $graph) { $null = $targets.Add([string]$g.subscriptionId) }
+        Write-RtLog ("Resource Graph: {0} recommendation(s) in {1} subscription(s) ({2:n1}s)" -f $graph.Count, $targets.Count, $sw.Elapsed.TotalSeconds)
     }
     catch {
         # Resource Graph unavailable -> scan every subscription in scope (titles may be generic).
+        Write-RtLog "Resource Graph failed, falling back to scanning all $(@($ScanSubscription).Count) subscription(s): $($_.Exception.Message)" -Level WARN
         foreach ($s in $ScanSubscription) { $null = $targets.Add($s) }
     }
+    Write-RtLog "Step 2/3: reading live status from Advisor in $($targets.Count) subscription(s)"
     $arm = @(Get-RtRawReviewRecommendation -Token $Token -SubscriptionId @($targets))
+    Write-RtLog ("Advisor: {0} review-linked recommendation(s) ({1:n1}s)" -f $arm.Count, $sw.Elapsed.TotalSeconds)
     $raw = @(Merge-RtRecommendationSource -Arm $arm -Graph $graph)
-    return ConvertTo-RtRecommendation -RawRecommendation $raw -Review $Review
+    Write-RtLog "Step 3/3: grouping $($raw.Count) item(s)"
+    $result = ConvertTo-RtRecommendation -RawRecommendation $raw -Review $Review
+    Write-RtLog ("Loaded {0} recommendation(s) in {1:n1}s" -f @($result).Count, $sw.Elapsed.TotalSeconds)
+    return $result
 }
 
 function Merge-RtDuplicateRecommendation {
@@ -768,6 +862,7 @@ function Invoke-RtStatusUpdate {
     foreach ($n in 'Invoke-RtArm', 'Get-RtProp', 'ConvertTo-RtStatusBucket', 'Get-RtUpdateOutcome') { $fns[$n] = (Get-Item "function:$n").ScriptBlock.ToString() }
     $api = $script:AdvisorApiVersion
     $isDemo = [bool]$Demo
+    Write-RtLog "Status update to $Status for $(@($Resource).Count) resource(s), $(@($Sibling).Count) related item(s) to re-read"
 
     # One work unit per resource + recommendation type; siblings ride along for the re-read.
     $units = [ordered]@{}
@@ -841,6 +936,7 @@ function Invoke-RtStatusUpdate {
             }
             $outcome = Get-RtUpdateOutcome -Target $target -ActualStatus $after.Status -PatchError $patchError -ReadError $after.Error
             $result.Success = $outcome.Success; $result.Verified = $outcome.Verified; $result.ActualStatus = $after.Status; $result.Message = $outcome.Message
+            [ResiliencyTriage.RtLog]::Write(($outcome.Success ? 'INFO' : 'WARN'), "Update $($res.ResourceName): $($outcome.Message)")
             [pscustomobject]$result
         }
     }
@@ -953,7 +1049,7 @@ function New-RtDemoData {
 
 Export-ModuleMember -Function @(
     'Get-RtProp', 'Get-RtDismissReason', 'Get-RtPriorityRank', 'ConvertTo-RtStatusBucket',
-    'Set-RtProxy', 'Assert-RtAzModule', 'Get-RtAzContextInfo', 'Connect-RtAzure', 'Get-RtArmToken',
+    'Initialize-RtLog', 'Write-RtLog', 'Get-RtRecentLog', 'Set-RtProxy', 'Assert-RtAzModule', 'Get-RtAzContextInfo', 'Connect-RtAzure', 'Get-RtArmToken',
     'Invoke-RtArm', 'Get-RtSubscription', 'Invoke-RtGraphQuery',
     'Get-RtReview', 'Get-RtReviewRecommendation', 'Get-RtGraphReviewRecommendation', 'Merge-RtRecommendationSource', 'Get-RtResourceTypeFromId', 'ConvertTo-RtRecommendation', 'Update-RtRecommendationStatus', 'Merge-RtDuplicateRecommendation',
     'Get-RtSummary', 'Export-RtRecommendation',

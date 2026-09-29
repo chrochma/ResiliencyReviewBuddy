@@ -29,6 +29,7 @@ A PowerShell TUI (text user interface) for the **resiliency reviews** your Micro
 | **Export** | Writes a task-planner CSV of all recommendations, or only the priorities you select. You can export only *Active* work or all statuses. |
 | **Triage** | Lists **all recommendations** of the selected reviews, sorted Critical → High → Medium → Low. Typing searches the **recommendation titles** live. Each row shows the title, number of affected resources, the **review** it comes from, a short description and the current status. A recommendation that appears in several reviews is listed **once**, under the most recent review (by publish date), and shown as `(+n) Review name`. A status change applies to its resources in **all** of those reviews. |
 | **Change status** | `Enter` on a recommendation opens the status picker. It shows the current status and switches **all affected resources** to **Completed**, **Postponed** or **Dismissed**. Dismiss asks for a reason; Postpone asks for a date. A details view (description, benefits, notes, resources) is one option away. |
+| **Activity log** | Writes every step and REST call to `exports\logs\session-*.log`. When loading takes more than 15 seconds, the latest activity appears under the spinner. |
 | **Background update** | The update runs as a background thread job, so you can keep triaging. Every resource is **re-read after the update** and the live status decides the result, so an API error on a change that Azure applied anyway still counts as a success. The TUI reports how many resources were **verified** and how many **failed**. Deleted resources are skipped. Details go to `exports\logs\update-*.csv`. |
 
 ## Prerequisites
@@ -63,6 +64,10 @@ cd .\ResiliencyReviewBuddy
 | `-Demo` | Offline demo mode |
 | `-Proxy` | Proxy URL, when the system proxy is not the right one (default: system proxy incl. PAC) |
 | `-ProxyCredential` | Explicit proxy credential when your Windows user is not accepted |
+
+### Activity log
+
+Every run writes an activity log to `exports\logs\session-<timestamp>.log`. It lists each step (sign-in, subscription scan, Resource Graph, Advisor reads, status updates) and every REST call with its status code and duration. Tokens and request bodies are never logged. If a loading step takes **longer than 15 seconds**, the spinner screen also shows the latest log lines and the path of the log file, so you can see what the tool is waiting for.
 
 ### Proxy
 

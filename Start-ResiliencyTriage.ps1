@@ -78,6 +78,8 @@ function Write-Banner {
 }
 
 Write-Banner
+$logFile = Initialize-RtLog -Folder (Join-Path $ExportPath 'logs')
+Write-RtLog "Parameters: Demo=$([bool]$Demo) TenantId='$TenantId' Subscriptions=$(@($SubscriptionId | Where-Object { $_ }).Count) Proxy='$Proxy' ProxyCredential=$([bool]$ProxyCredential)"
 $ctx = $null
 if ($Demo) {
     Write-Host '  Demo mode: fictional data, no Azure calls.' -ForegroundColor Yellow
@@ -86,6 +88,7 @@ if ($Demo) {
 else {
     # Authenticate to a corporate proxy with the user context before any web call (HTTP 407).
     $proxyUri = Set-RtProxy -Proxy $Proxy -Credential $ProxyCredential
+    Write-RtLog ($proxyUri ? "Proxy for ARM: $proxyUri" : 'No proxy for ARM (direct connection)')
     if ($proxyUri) {
         $who = if ($ProxyCredential) { $ProxyCredential.UserName } else { "$env:USERDOMAIN\$env:USERNAME" }
         Write-Host ("  Proxy        : {0} (authenticating as {1})" -f $proxyUri, $who) -ForegroundColor DarkGray
@@ -106,6 +109,7 @@ else {
         $answer = Read-Host '  Reuse this context? [Y/n]'
         if ($answer -and $answer -notmatch '^(y|yes|j|ja)$') { $reuse = $false }
         if (-not $reuse) { $ctx = $null }
+        Write-RtLog "Existing context for tenant $($ctx ? $ctx.TenantId : '-') reused: $reuse"
     }
     else {
         Write-Host '  No Azure context found - starting sign-in.' -ForegroundColor Yellow
@@ -118,6 +122,7 @@ else {
     # Fail early if no ARM token can be obtained for the context.
     $null = Get-RtArmToken
 }
+Write-Host "  Activity log : $logFile" -ForegroundColor DarkGray
 
 #endregion
 
@@ -569,6 +574,10 @@ try {
         }
     }
 }
+catch {
+    Write-RtLog "Fatal: $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)" -Level ERROR
+    throw
+}
 finally {
     Exit-RtScreen
     # Never leave updates half-way; they are short-lived, so wait for them silently.
@@ -579,6 +588,9 @@ finally {
         Write-Host '  Session summary' -ForegroundColor Cyan
         foreach ($h in $state.History) { Write-Host "   $h" }
     }
+    Write-RtLog 'Session ended'
+    Write-Host ''
+    Write-Host "  Activity log: $logFile" -ForegroundColor DarkGray
     Write-Host ''
 }
 
