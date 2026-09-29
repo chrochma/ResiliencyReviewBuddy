@@ -80,17 +80,37 @@ Write-Host 'Summary first, resources on demand' -ForegroundColor Cyan
 # Resource Graph summary rows (one per recommendation and raw status) built from the demo data.
 $countRows = foreach ($rec in $recs) {
     foreach ($g in ($rec.Resources | Group-Object Status)) {
-        [pscustomobject]@{ rid = "/subscriptions/x/providers/Microsoft.Advisor/resiliencyReviews/$($rec.ReviewId)"; rname = $rec.ReviewName; typeId = $rec.RecommendationTypeId; label = $rec.Label; groupKey = $rec.Label; st = $g.Name; n = $g.Count }
+        [pscustomobject]@{ rid = "/subscriptions/x/providers/Microsoft.Advisor/resiliencyReviews/$($rec.ReviewId)"; rname = $rec.ReviewName; typeId = $rec.RecommendationTypeId; label = $rec.Label; groupKey = $rec.Label; pri = $rec.Priority; st = $g.Name; n = $g.Count }
     }
 }
 $textRows = foreach ($rec in $recs) {
-    [pscustomobject]@{ rid = "/subscriptions/x/providers/Microsoft.Advisor/resiliencyReviews/$($rec.ReviewId)"; rname = $rec.ReviewName; typeId = $rec.RecommendationTypeId; label = $rec.Label; groupKey = $rec.Label; description = $rec.Description; priority = $rec.Priority; problem = ''; solution = ''; benefits = ''; notes = ''; link = ''; category = $rec.Category }
+    [pscustomobject]@{ rid = "/subscriptions/x/providers/Microsoft.Advisor/resiliencyReviews/$($rec.ReviewId)"; rname = $rec.ReviewName; typeId = $rec.RecommendationTypeId; label = $rec.Label; groupKey = $rec.Label; pri = $rec.Priority; description = $rec.Description; priority = $rec.Priority; problem = ''; solution = ''; benefits = ''; notes = ''; link = ''; category = $rec.Category }
 }
 $sum = @(ConvertFrom-RtSummaryRow -CountRow @($countRows) -TextRow @($textRows) -Review $demo.Reviews)
 Assert-That ($sum.Count -eq $recs.Count) "summary: one recommendation per group ($($sum.Count))"
 $bad = @($sum | Where-Object { $k = $_.Key; $full = $recs | Where-Object Key -eq $k; -not $full -or $full.ResourceCount -ne $_.ResourceCount -or $full.Status -ne $_.Status -or $full.Priority -ne $_.Priority })
 Assert-That ($bad.Count -eq 0) 'summary keys, counts, status and priority match the resource-level data'
 Assert-That (@($sum | Where-Object ResourcesLoaded).Count -eq 0) 'summary has no resources loaded'
+# Same label twice in one review with different priorities -> two recommendations (portal shows both).
+$r0 = $recs[0]; $rid0 = "/subscriptions/x/providers/Microsoft.Advisor/resiliencyReviews/$($r0.ReviewId)"
+$twin = @(
+    [pscustomobject]@{ rid = $rid0; rname = $r0.ReviewName; typeId = 't'; label = 'Same title'; groupKey = 'Same title'; pri = 'Critical'; st = 'New'; n = 16 }
+    [pscustomobject]@{ rid = $rid0; rname = $r0.ReviewName; typeId = 't'; label = 'Same title'; groupKey = 'Same title'; pri = 'High'; st = 'Completed'; n = 14 }
+)
+$twinRecs = @(ConvertFrom-RtSummaryRow -CountRow $twin -Review $demo.Reviews)
+Assert-That ($twinRecs.Count -eq 2 -and ($twinRecs | Where-Object Priority -eq 'Critical').Status -eq 'Active') 'same label with different priority stays separate'
+Assert-That (@(Merge-RtDuplicateRecommendation -Recommendation $twinRecs -Review $demo.Reviews).Count -eq 2) 'triage view keeps both priorities'
+# Detail view with exactly one other review (single string must not break .Count under StrictMode).
+& (Get-Module ResiliencyTriage.Tui) {
+    function script:Read-RtKey { param($OnTick) [pscustomobject]@{ Key = 'Escape'; KeyChar = [char]27; Modifiers = 0 } }
+    function script:Write-RtFrame { param($Frame) }
+    function script:Get-RtSize { [pscustomobject]@{ Width = 160; Height = 45 } }
+}
+$detail = @(Merge-RtDuplicateRecommendation -Recommendation @($twinRecs[0]) -Review $demo.Reviews)[0]
+$detail.OtherReviews = @('Other review')
+$ok = $true; try { $null = Show-RtRecommendationDetail -Recommendation $detail } catch { $ok = $false }
+Assert-That $ok 'detail view works with exactly one other review'
+Import-Module (Join-Path $root 'modules\ResiliencyTriage.Tui.psm1') -Force
 $sumOverall = (Get-RtSummary -Recommendation $sum -Review $demo.Reviews).Overall
 Assert-That ($sumOverall.ResourceTotal -eq $resourceTotal) 'overview counts work without resources'
 $sumViews = @(Merge-RtDuplicateRecommendation -Recommendation $sum -Review $demo.Reviews)

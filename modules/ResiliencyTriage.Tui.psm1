@@ -600,7 +600,7 @@ function Show-RtRecommendationDetail {
         $body.Add(("Priority: {0}{1}{2}   Status: {3}{4}{2}   Resources: {5}   Category: {6}" -f `
             (Get-RtPriorityCell $r.Priority), $r.Priority, $script:C.Reset, (Get-RtStatusColor $r.Status), $statusText, $(if ($r.PSObject.Properties['ResourceCount']) { $r.ResourceCount } else { $r.Resources.Count }), $r.Category))
         $body.Add("$($script:C.Muted)Review: $($r.ReviewName)   Workload: $($r.WorkloadName)$($script:C.Reset)")
-        $others = if ($r.PSObject.Properties['OtherReviews']) { @($r.OtherReviews) } else { @() }
+        $others = @(if ($r.PSObject.Properties['OtherReviews']) { $r.OtherReviews })
         if ($others.Count) { $body.Add("$($script:C.Muted)Also in: $($others -join ', ') (status changes apply to all)$($script:C.Reset)") }
         $body.Add("Resource status: $(Format-RtCounts $r.StatusCounts)")
         $body.Add('')
