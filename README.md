@@ -24,7 +24,7 @@ A PowerShell TUI (text user interface) for the **resiliency reviews** your Micro
 | Step | What happens |
 |------|--------------|
 | **Sign-in** | Finds an existing `Az` context, shows the account and tenant, and asks if you want to reuse it. Otherwise it runs `Connect-AzAccount` (browser or `-UseDeviceAuthentication`). |
-| **Review selection** | Lists every resiliency review in your subscriptions. Pick reviews with checkboxes (`Space` toggles one, `A` toggles all). |
+| **Review selection** | Lists every resiliency review you can see (see [Review discovery](#review-discovery)), with the number of affected resources. Pick reviews with checkboxes (`Space` toggles one, `A` toggles all). Very large selections (default > 25,000 resource items) ask before loading. |
 | **Progress overview** | Stacked progress bar with counts for the selected reviews and for each review. Counts are shown per recommendation and per resource: **Active** (Not started + In progress), **Postponed**, **Completed** and **Dismissed** (formerly *Rejected*). |
 | **Export** | Writes a task-planner CSV of all recommendations, or only the priorities you select. You can export only *Active* work or all statuses. |
 | **Triage** | Lists **all recommendations** of the selected reviews, sorted Critical → High → Medium → Low. Typing searches the **recommendation titles** live. Each row shows the title, number of affected resources, the **review** it comes from, a short description and the current status. A recommendation that appears in several reviews is listed **once**, under the most recent review (by publish date), and shown as `(+n) Review name`. A status change applies to its resources in **all** of those reviews. |
@@ -58,12 +58,25 @@ cd .\ResiliencyReviewBuddy
 | Parameter | Description |
 |-----------|-------------|
 | `-TenantId` | Tenant for a new sign-in |
-| `-SubscriptionId` | Only scan these subscriptions (default: all enabled) |
+| `-SubscriptionId` | Only scan these subscriptions (default: all except Disabled / Deleted) |
 | `-UseDeviceAuthentication` | Device code sign-in |
 | `-ExportPath` | Folder for CSV exports and failure logs (default `.\exports`) |
 | `-Demo` | Offline demo mode |
 | `-Proxy` | Proxy URL, when the system proxy is not the right one (default: system proxy incl. PAC) |
 | `-ProxyCredential` | Explicit proxy credential when your Windows user is not accepted |
+| `-LargeReviewThreshold` | Resource items above which a review selection asks for confirmation (default 25000) |
+
+### Review discovery
+
+Reviews are collected from three sources, so none is missed:
+
+1. **ARM list** per subscription (parallel, network errors and timeouts are retried).
+2. **Resource Graph** `microsoft.advisor/resiliencyreviews` across all subscriptions.
+3. **Review references on recommendations.** A review resource can sit in a subscription you cannot read while its recommendations sit in subscriptions you can. Such reviews are listed with status `Unknown` and can be triaged normally.
+
+Subscriptions that could not be read are counted on the selection screen and listed in the activity log.
+
+For large subscriptions (more than 5,000 Advisor items) the live Advisor list API is far too slow (100 items per page), so the status comes from Resource Graph, which can lag a few minutes. Status updates are still verified live per resource.
 
 ### Activity log
 
@@ -114,9 +127,9 @@ The tool calls ARM REST directly, using a token from `Get-AzAccessToken`. Only `
 
 | Purpose | Call |
 |---------|------|
-| Reviews | `GET /subscriptions/{sub}/providers/Microsoft.Advisor/resiliencyReviews` (tries `2026-03-01-preview` first, then falls back to older versions) |
+| Reviews | `GET /subscriptions/{sub}/providers/Microsoft.Advisor/resiliencyReviews` (tries `2026-03-01-preview` first, then falls back to older versions), plus Resource Graph (see [Review discovery](#review-discovery)) |
 | Titles and texts | Resource Graph `advisorresources` (`label`, `description`, `potentialBenefits`, `notes`). The ARM list API omits these for review items. Also narrows which subscriptions are scanned. |
-| Recommendations | `GET /subscriptions/{sub}/providers/Microsoft.Advisor/recommendations`, keeping only items that link to a review (`properties.review`) |
+| Recommendations | `GET /subscriptions/{sub}/providers/Microsoft.Advisor/recommendations`, keeping only items that link to a review (`properties.review`). Subscriptions with more than 5,000 Advisor items use Resource Graph instead. |
 | Set status | `PATCH …/Microsoft.Advisor/recommendations/{name}` with `recommendationStatus` (`Postponed`, `Completed`, `Dismissed`), plus `recommendationDismissReason` or `postponedUntilDateTime` |
 | Verify | `GET {resourceId}/providers/Microsoft.Advisor/recommendations/{name}` after each change |
 

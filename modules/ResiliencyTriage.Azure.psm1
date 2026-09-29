@@ -225,7 +225,7 @@ function Invoke-RtArm {
     .SYNOPSIS
         Sends an ARM request with a bearer token and returns the parsed body.
     .DESCRIPTION
-        Retries throttling (429) and transient 5xx responses. Throws on any other error;
+        Retries throttling (429), transient 5xx responses and network errors/timeouts. Throws on any other error;
         the exception message starts with 'HTTP <code>' so callers can react to it.
         With -AllPages the 'value' arrays of all pages (nextLink) are concatenated.
         Self-contained (only needs Get-RtProp) so it can be recreated in parallel runspaces.
@@ -263,6 +263,12 @@ function Invoke-RtArm {
             catch {
                 [ResiliencyTriage.RtLog]::Write('ERROR', ("<- {0} {1} failed after {2:n1}s: {3}" -f $Method, $short, $sw.Elapsed.TotalSeconds, $_.Exception.Message))
                 if ("$_" -match '407') { throw "Proxy authentication failed (HTTP 407). Your Windows user was rejected by the proxy - run again with -ProxyCredential (Get-Credential) or -Proxy <url>. Details: $_" }
+                # Timeouts and dropped connections (busy proxies) are worth another try; PATCH is idempotent here.
+                if ($attempt -le 3) {
+                    [ResiliencyTriage.RtLog]::Write('WARN', "Network error - retry $attempt in $(2 * $attempt)s")
+                    Start-Sleep -Seconds (2 * $attempt)
+                    continue
+                }
                 throw
             }
             $code = [int]$resp.StatusCode
@@ -300,11 +306,12 @@ function Invoke-RtArm {
 }
 
 function Get-RtSubscription {
-    <# Enabled subscriptions visible to the token's tenant. #>
+    <# Readable subscriptions visible to the token's tenant. #>
     param([Parameter(Mandatory)][string]$Token)
     $subs = Invoke-RtArm -Token $Token -Path '/subscriptions' -ApiVersion $script:SubscriptionApi -AllPages
     Write-RtLog "Subscriptions visible: $(@($subs).Count)"
-    @($subs | Where-Object { (Get-RtProp $_ 'state') -eq 'Enabled' } | ForEach-Object {
+    # Warned / PastDue subscriptions are still readable; only Disabled / Deleted are skipped.
+    @($subs | Where-Object { (Get-RtProp $_ 'state') -notin 'Disabled', 'Deleted' } | ForEach-Object {
         [pscustomobject]@{ SubscriptionId = [string]$_.subscriptionId; Name = [string]$_.displayName; TenantId = [string](Get-RtProp $_ 'tenantId') }
     })
 }
@@ -334,27 +341,70 @@ function Invoke-RtGraphQuery {
 
 #region Reviews
 
+function ConvertTo-RtIsoDate {
+    <# Normalizes a date (DateTime from ConvertFrom-Json or string) to sortable ISO 8601 text. #>
+    param([object]$Value)
+    if ($null -eq $Value -or "$Value" -eq '') { return '' }
+    if ($Value -is [datetime]) { return $Value.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+    $d = [datetime]::MinValue
+    if ([datetime]::TryParse([string]$Value, [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$d)) {
+        return $d.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    }
+    return [string]$Value
+}
+
+function New-RtReviewObject {
+    <# Review object from an ARM or Resource Graph resiliencyReviews item. #>
+    param([object]$Item, [string]$SubscriptionId, [string]$SubscriptionName, [string]$Source)
+    $p = Get-RtProp $Item 'properties' $null
+    [pscustomobject]@{
+        ReviewId             = [string](Get-RtProp $Item 'name')
+        ReviewName           = [string](Get-RtProp $p 'reviewName')
+        WorkloadName         = [string](Get-RtProp $p 'workloadName')
+        ReviewStatus         = [string](Get-RtProp $p 'reviewStatus')
+        RecommendationsCount = [int](Get-RtProp $p 'recommendationsCount' 0)
+        PublishedAt          = ConvertTo-RtIsoDate (Get-RtProp $p 'publishedAt')
+        UpdatedAt            = ConvertTo-RtIsoDate (Get-RtProp $p 'updatedAt')
+        SubscriptionId       = $SubscriptionId
+        SubscriptionName     = $SubscriptionName
+        ResourceId           = [string](Get-RtProp $Item 'id')
+        Source               = $Source
+        ItemCount            = $null
+    }
+}
+
 function Get-RtReview {
     <#
     .SYNOPSIS
-        Lists the resiliency reviews published in the given subscriptions (scanned in parallel).
+        Finds every resiliency review the signed-in user can see.
+    .DESCRIPTION
+        Three sources are combined so no review is missed:
+          1. ARM list per subscription (live, parallel; failures are retried and reported)
+          2. Resource Graph 'microsoft.advisor/resiliencyreviews' (one query for all subscriptions)
+          3. Review references on Advisor recommendations (reviews whose review resource sits in a
+             subscription you cannot read, but whose recommendations you can)
     .OUTPUTS
-        Reviews plus the subscriptions that could not be read (403/404 are expected for many).
+        Reviews plus the subscriptions that could not be read.
     #>
     param(
         [Parameter(Mandatory)][string]$Token,
         [Parameter(Mandatory)][object[]]$Subscription,
-        [int]$ThrottleLimit = 12
+        [int]$ThrottleLimit = 12,
+        [switch]$SkipGraph
     )
-    $armFn = ${function:Invoke-RtArm}.ToString()
-    $propFn = ${function:Get-RtProp}.ToString()
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $subName = @{}
+    foreach ($s in $Subscription) { $subName[([string]$s.SubscriptionId).ToLowerInvariant()] = [string]$s.Name }
+    $fns = @{}
+    foreach ($n in 'Invoke-RtArm', 'Get-RtProp', 'ConvertTo-RtIsoDate', 'New-RtReviewObject') { $fns[$n] = (Get-Item "function:$n").ScriptBlock.ToString() }
     $apiVersions = $script:ReviewApiVersions
-    Write-RtLog "Scanning $(@($Subscription).Count) subscription(s) for resiliency reviews (parallel $ThrottleLimit)"
+    $total = @($Subscription).Count
+    $progress = [hashtable]::Synchronized(@{ Done = 0 })
+    Write-RtLog "Step 1/3: listing resiliency reviews in $total subscription(s) (parallel $ThrottleLimit)"
 
     $results = $Subscription | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
         Set-StrictMode -Version Latest
-        ${function:Invoke-RtArm} = [scriptblock]::Create($using:armFn)
-        ${function:Get-RtProp} = [scriptblock]::Create($using:propFn)
+        foreach ($e in ($using:fns).GetEnumerator()) { Set-Item "function:$($e.Key)" ([scriptblock]::Create($e.Value)) }
         $sub = $_
         $items = $null; $lastError = ''
         foreach ($api in $using:apiVersions) {
@@ -368,36 +418,98 @@ function Get-RtReview {
                 if ($lastError -notmatch 'InvalidApiVersion|NoRegisteredProviderFound|api-version') { break }
             }
         }
+        $prog = $using:progress
+        [System.Threading.Monitor]::Enter($prog.SyncRoot)
+        try { $prog.Done++; $n = $prog.Done } finally { [System.Threading.Monitor]::Exit($prog.SyncRoot) }
+        if ($n % 10 -eq 0 -or $n -eq $using:total) { [ResiliencyTriage.RtLog]::Write('INFO', "Scanned $n of $($using:total) subscription(s)") }
         if ($null -eq $items) {
-            [pscustomobject]@{ Kind = 'Error'; SubscriptionId = $sub.SubscriptionId; Message = $lastError }
+            [ResiliencyTriage.RtLog]::Write('WARN', "Reviews of $($sub.Name) ($($sub.SubscriptionId)) not readable: $lastError")
+            [pscustomobject]@{ Kind = 'Error'; SubscriptionId = $sub.SubscriptionId; Name = $sub.Name; Message = $lastError }
             return
         }
+        if (@($items).Count) { [ResiliencyTriage.RtLog]::Write('INFO', "$(@($items).Count) review(s) in $($sub.Name)") }
         foreach ($item in @($items)) {
-            $p = Get-RtProp $item 'properties' $null
-            [pscustomobject]@{
-                Kind                 = 'Review'
-                ReviewId             = [string](Get-RtProp $item 'name')
-                ReviewName           = [string](Get-RtProp $p 'reviewName')
-                WorkloadName         = [string](Get-RtProp $p 'workloadName')
-                ReviewStatus         = [string](Get-RtProp $p 'reviewStatus')
-                RecommendationsCount = [int](Get-RtProp $p 'recommendationsCount' 0)
-                PublishedAt          = [string](Get-RtProp $p 'publishedAt')
-                UpdatedAt            = [string](Get-RtProp $p 'updatedAt')
-                SubscriptionId       = [string]$sub.SubscriptionId
-                SubscriptionName     = [string]$sub.Name
-                ResourceId           = [string](Get-RtProp $item 'id')
-            }
+            $r = New-RtReviewObject -Item $item -SubscriptionId $sub.SubscriptionId -SubscriptionName $sub.Name -Source 'ARM'
+            $r | Add-Member -NotePropertyName Kind -NotePropertyValue 'Review' -PassThru
         }
     }
 
-    $reviews = @($results | Where-Object Kind -eq 'Review' | Select-Object * -ExcludeProperty Kind |
-        Sort-Object -Property @{ Expression = 'PublishedAt'; Descending = $true }, ReviewName)
-    $errors = @($results | Where-Object Kind -eq 'Error')
-    Write-RtLog "Found $($reviews.Count) review(s); $($errors.Count) subscription(s) not readable"
-    foreach ($e in $errors | Select-Object -First 20) { Write-RtLog "  $($e.SubscriptionId): $($e.Message)" -Level WARN }
+    $byId = [ordered]@{}
+    $errors = [System.Collections.Generic.List[object]]::new()
+    foreach ($r in @($results)) {
+        if ($r.Kind -eq 'Error') { $errors.Add($r); continue }
+        $r.PSObject.Properties.Remove('Kind')
+        $byId[$r.ReviewId.ToLowerInvariant()] = $r
+    }
+    $errors = $errors.ToArray()
+    Write-RtLog ("ARM: {0} review(s), {1} subscription(s) not readable ({2:n1}s)" -f $byId.Count, $errors.Count, $sw.Elapsed.TotalSeconds)
+
+    if (-not $SkipGraph) {
+        $ids = @($Subscription.SubscriptionId)
+        try {
+            Write-RtLog 'Step 2/3: Resource Graph - resiliency reviews'
+            $rows = @(Invoke-RtGraphQuery -Token $Token -SubscriptionId $ids -Query "advisorresources | where type =~ 'microsoft.advisor/resiliencyreviews' | project id, name, subscriptionId, properties")
+            $added = 0
+            foreach ($row in $rows) {
+                $key = ([string]$row.name).ToLowerInvariant()
+                if ($byId.Contains($key)) { continue }
+                $sid = [string]$row.subscriptionId
+                $byId[$key] = New-RtReviewObject -Item $row -SubscriptionId $sid -SubscriptionName ($subName[$sid.ToLowerInvariant()] ?? $sid) -Source 'ResourceGraph'
+                $added++
+                Write-RtLog "Resource Graph added review '$($byId[$key].ReviewName)' (missing in the ARM list)" -Level WARN
+            }
+            Write-RtLog "Resource Graph: $($rows.Count) review(s), $added not returned by ARM"
+
+            Write-RtLog 'Step 3/3: Resource Graph - reviews referenced by recommendations'
+            $query = @"
+advisorresources
+| where type =~ 'microsoft.advisor/recommendations'
+| where isnotempty(properties.review)
+| extend rid = tostring(properties.review.id), rname = tostring(properties.review.name)
+| summarize items = count(), recs = dcount(tostring(properties.label)), subs = make_set(subscriptionId, 20), workload = take_any(tostring(properties.resourceWorkload.name)) by rid, rname
+"@
+            $refs = @(Invoke-RtGraphQuery -Token $Token -SubscriptionId $ids -Query $query)
+            $added = 0
+            foreach ($ref in $refs) {
+                $rid = ([string]$ref.rid).TrimEnd('/').Split('/')[-1].ToLowerInvariant()
+                if (-not $rid -or $byId.Contains($rid)) { continue }
+                if (@($byId.Values | Where-Object { $_.ReviewName -and $_.ReviewName -eq [string]$ref.rname }).Count) { continue }
+                $sid = [string]@($ref.subs)[0]
+                $byId[$rid] = [pscustomobject]@{
+                    ReviewId             = $rid
+                    ReviewName           = [string]$ref.rname
+                    WorkloadName         = [string]$ref.workload
+                    ReviewStatus         = 'Unknown'
+                    RecommendationsCount = [int]$ref.recs
+                    PublishedAt          = ''
+                    UpdatedAt            = ''
+                    SubscriptionId       = $sid
+                    SubscriptionName     = ($subName[$sid.ToLowerInvariant()] ?? $sid)
+                    ResourceId           = ''
+                    Source               = 'Recommendations'
+                    ItemCount            = $null
+                }
+                $added++
+                Write-RtLog "Review '$($ref.rname)' found only via its recommendations (review resource not readable)" -Level WARN
+            }
+            Write-RtLog "Recommendations reference $($refs.Count) review(s), $added not found before"
+            # Resource-level item count per review: very large reviews take long to load.
+            foreach ($rv in $byId.Values) {
+                $n = 0
+                foreach ($ref in $refs) {
+                    $rid = ([string]$ref.rid).TrimEnd('/').Split('/')[-1]
+                    if ($rid -eq $rv.ReviewId -or ($rv.ReviewName -and [string]$ref.rname -eq $rv.ReviewName)) { $n += [int]$ref.items }
+                }
+                $rv.ItemCount = $n
+            }
+        }
+        catch { Write-RtLog "Resource Graph review discovery failed: $($_.Exception.Message)" -Level WARN }
+    }
+
+    $reviews = @($byId.Values | Sort-Object -Property @{ Expression = { $_.PublishedAt }; Descending = $true }, ReviewName)
+    Write-RtLog ("Found {0} review(s) in {1:n1}s" -f $reviews.Count, $sw.Elapsed.TotalSeconds)
     [pscustomobject]@{ Reviews = $reviews; FailedSubscriptions = $errors }
 }
-
 #endregion
 
 #region Recommendations
@@ -515,6 +627,7 @@ function ConvertTo-RtRecommendation {
     }
 
     $groups = [ordered]@{}
+    $resIndex = @{}   # group|resource -> entry (fast duplicate lookup for large reviews)
     foreach ($raw in $RawRecommendation) {
         $p = Get-RtProp $raw 'properties' $null
         $revId = ([string](Get-RtProp $p 'review.id')).TrimEnd('/').Split('/')[-1].ToLowerInvariant()
@@ -579,13 +692,13 @@ function ConvertTo-RtRecommendation {
         $resKey = if ($resourceId) { $resourceId.TrimEnd('/').ToLowerInvariant() } else { $armId.ToLowerInvariant() }
         $updated = [datetime]::MinValue
         $null = [datetime]::TryParse([string](Get-RtProp $p 'lastUpdated'), [cultureinfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind, [ref]$updated)
-        $existing = $groups[$key].Resources | Where-Object { $_.ResourceKey -eq $resKey } | Select-Object -First 1
+        $existing = $resIndex["$key|$resKey"]
         if ($existing) {
             $better = ($isCurrent -and -not $existing.IsCurrent) -or ($isCurrent -eq $existing.IsCurrent -and $updated -gt $existing.LastUpdated)
             if (-not $better) { continue }
             $null = $groups[$key].Resources.Remove($existing)
         }
-        $groups[$key].Resources.Add([pscustomobject]@{
+        $entry = [pscustomobject]@{
             ResourceKey         = $resKey
             IsCurrent           = $isCurrent
             LastUpdated         = $updated
@@ -602,7 +715,9 @@ function ConvertTo-RtRecommendation {
             RawStatus           = $rawStatus
             PostponedUntil      = [string](Get-RtProp $p 'postponedUntilDateTime')
             DismissReason       = [string](Get-RtProp $p 'recommendationDismissReason')
-        })
+        }
+        $groups[$key].Resources.Add($entry)
+        $resIndex["$key|$resKey"] = $entry
     }
 
     $list = @($groups.Values)
@@ -633,7 +748,8 @@ function Get-RtReviewRecommendation {
     param(
         [Parameter(Mandatory)][string]$Token,
         [Parameter(Mandatory)][object[]]$Review,
-        [Parameter(Mandatory)][string[]]$ScanSubscription
+        [Parameter(Mandatory)][string[]]$ScanSubscription,
+        [int]$MaxLiveItem = 5000
     )
     $targets = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($r in $Review) { $null = $targets.Add($r.SubscriptionId) }
@@ -651,8 +767,22 @@ function Get-RtReviewRecommendation {
         Write-RtLog "Resource Graph failed, falling back to scanning all $(@($ScanSubscription).Count) subscription(s): $($_.Exception.Message)" -Level WARN
         foreach ($s in $ScanSubscription) { $null = $targets.Add($s) }
     }
+    if ($graph.Count -and $targets.Count) {
+        # The Advisor list API returns ALL recommendations of a subscription (100 per page) - with
+        # tens of thousands that takes many minutes. Those subscriptions use the Resource Graph status.
+        try {
+            $sizes = @(Invoke-RtGraphQuery -Token $Token -SubscriptionId @($targets) -Query "advisorresources | where type =~ 'microsoft.advisor/recommendations' | summarize n = count() by subscriptionId")
+            foreach ($z in $sizes) {
+                if ([int]$z.n -gt $MaxLiveItem) {
+                    $null = $targets.Remove([string]$z.subscriptionId)
+                    Write-RtLog ("Subscription {0}: {1:n0} Advisor items - using Resource Graph status (may lag a few minutes)" -f $z.subscriptionId, [int]$z.n)
+                }
+            }
+        }
+        catch { Write-RtLog "Resource Graph size check failed: $($_.Exception.Message)" -Level WARN }
+    }
     Write-RtLog "Step 2/3: reading live status from Advisor in $($targets.Count) subscription(s)"
-    $arm = @(Get-RtRawReviewRecommendation -Token $Token -SubscriptionId @($targets))
+    $arm = if ($targets.Count) { @(Get-RtRawReviewRecommendation -Token $Token -SubscriptionId @($targets)) } else { @() }
     Write-RtLog ("Advisor: {0} review-linked recommendation(s) ({1:n1}s)" -f $arm.Count, $sw.Elapsed.TotalSeconds)
     $raw = @(Merge-RtRecommendationSource -Arm $arm -Graph $graph)
     Write-RtLog "Step 3/3: grouping $($raw.Count) item(s)"

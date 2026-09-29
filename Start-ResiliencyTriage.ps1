@@ -35,6 +35,9 @@
 .PARAMETER ProxyCredential
     Credential for the proxy when your Windows user is not accepted.
 
+.PARAMETER LargeReviewThreshold
+    Resource-level items above which a review selection asks for confirmation before loading (default 25000).
+
 .EXAMPLE
     .\Start-ResiliencyTriage.ps1
 
@@ -52,7 +55,8 @@ param(
     [string]$ExportPath = (Join-Path $PSScriptRoot 'exports'),
     [switch]$Demo,
     [string]$Proxy,
-    [pscredential]$ProxyCredential
+    [pscredential]$ProxyCredential,
+    [int]$LargeReviewThreshold = 25000
 )
 
 Set-StrictMode -Version Latest
@@ -186,20 +190,43 @@ function Select-Reviews {
         @{ Header = 'Workload'; Flex = 2; Value = { param($r) $r.WorkloadName } }
         @{ Header = 'Status'; Width = 11; Value = { param($r) $r.ReviewStatus } }
         @{ Header = 'Recs'; Width = 5; Value = { param($r) $r.RecommendationsCount } }
+        @{ Header = 'Resources'; Width = 9; Value = { param($r) if ($r.PSObject.Properties['ItemCount'] -and $null -ne $r.ItemCount) { '{0:n0}' -f $r.ItemCount } else { '' } } }
         @{ Header = 'Published'; Width = 10; Value = { param($r) if ($r.PublishedAt) { ([datetime]$r.PublishedAt).ToString('yyyy-MM-dd') } else { '' } } }
         @{ Header = 'Subscription'; Flex = 2; Value = { param($r) if ($r.SubscriptionName) { $r.SubscriptionName } else { $r.SubscriptionId } } }
     )
     $intro = @(
         "Found $($Clr.Bold)$($state.AllReviews.Count)$($Clr.Reset) resiliency review(s) in $($state.Subscriptions.Count) subscription(s). Select the reviews to work with:"
-        ''
     )
+    if ($state.FailedSubs.Count) {
+        $intro += "$($Clr.Warn)$($state.FailedSubs.Count) subscription(s) could not be read - reviews there may be missing. Details: $logFile$($Clr.Reset)"
+    }
+    $viaRecs = @($state.AllReviews | Where-Object { $_.PSObject.Properties['Source'] -and $_.Source -eq 'Recommendations' }).Count
+    if ($viaRecs) { $intro += "$($Clr.Muted)$viaRecs review(s) found only via their recommendations (status 'Unknown': review resource not readable).$($Clr.Reset)" }
+    $intro += ''
     $pre = @()
     if ($state.SelectedReviews.Count) {
         for ($i = 0; $i -lt $state.AllReviews.Count; $i++) { if ($state.AllReviews[$i].ReviewId -in $state.SelectedReviews.ReviewId) { $pre += $i } }
     }
     elseif ($state.AllReviews.Count -eq 1) { $pre = @(0) }
-    $picked = Show-RtCheckList -Title 'Select reviews' -Item $state.AllReviews -Column $cols -Lines $intro -Preselect $pre -RequireSelection
-    if ($null -eq $picked) { return $false }
+    while ($true) {
+        $picked = Show-RtCheckList -Title 'Select reviews' -Item $state.AllReviews -Column $cols -Lines $intro -Preselect $pre -RequireSelection
+        if ($null -eq $picked) { return $false }
+        # Every affected resource is one Advisor item that has to be downloaded.
+        $items = (@($picked | ForEach-Object { if ($_.PSObject.Properties['ItemCount'] -and $_.ItemCount) { [int]$_.ItemCount } else { 0 } }) | Measure-Object -Sum).Sum
+        if ($items -le $LargeReviewThreshold) { break }
+        $big = @($picked | Where-Object { $_.PSObject.Properties['ItemCount'] -and $_.ItemCount -gt 5000 } | ForEach-Object { "  - $($_.ReviewName): {0:n0} resource item(s)" -f $_.ItemCount })
+        $minutes = [Math]::Ceiling($items / 1000 * 2 / 60)
+        $lines = @(
+            "$($Clr.Warn)The selection contains {0:n0} resource-level Advisor items.$($Clr.Reset)" -f $items
+            ''
+        ) + $big + @(
+            ''
+            "Loading them can take $minutes+ minute(s) and a lot of memory."
+            'Tip: select the large review on its own, or run again with -SubscriptionId to narrow the scope.'
+        )
+        if (Read-RtConfirm -Title 'Large selection' -Lines $lines -Question 'Load anyway?' -Default $false) { break }
+        $pre = @(for ($i = 0; $i -lt $state.AllReviews.Count; $i++) { if ($state.AllReviews[$i].ReviewId -in $picked.ReviewId) { $i } })
+    }
     $state.SelectedReviews = @($picked)
     Update-ContextLine
     return $true
